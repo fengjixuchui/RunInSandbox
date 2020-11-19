@@ -7,6 +7,15 @@ import "ocidl.idl";
  uuid(570FBF3C-D853-435E-B761-6A264393B9DA)]
 interface ISimpleCalculator : IUnknown {
     HRESULT Add ([in] int a, [in] int b, [out,retval] int * sum);
+
+    [helpstring("Check if object is running in an elevated process")]
+    HRESULT IsElevated ([out] BOOL * is_elevated, [out] BOOL * high_integrity);
+
+    [helpstring("Check if object has network access")]
+    HRESULT TestNetworkConnection([in] BSTR host, [in] USHORT port, [out,retval] BOOL * can_access);
+
+    [helpstring("For testing of nested COM object creation")]
+    HRESULT CreateInstance ([in] BOOL elevated, [in] CLSID clsid, [out,retval] IUnknown ** obj);
 };
 
 
@@ -23,4 +32,3 @@ library TestControl {
         [default] interface ISimpleCalculator;
     };
 };
-

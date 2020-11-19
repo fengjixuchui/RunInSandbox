@@ -4,6 +4,8 @@
 #include <Windows.h>
 #include <comdef.h>
 #include <versionhelpers.h>
+#include <aclapi.h> // for SE_FILE_OBJECT
+#include <sddl.h> // for SDDL_REVISION_1
 #include <userenv.h>
 #pragma comment(lib, "Userenv.lib")
 #include <Winternl.h>
@@ -100,8 +102,10 @@ static_assert(sizeof(SidWrap) == sizeof(PSID), "SidWrap size mismatch");
 class AppContainerWrap {
 public:
     AppContainerWrap() {
+        // https://docs.microsoft.com/en-us/windows/uwp/packaging/app-capability-declarations
         const WELL_KNOWN_SID_TYPE capabilities[] = {
-            WinCapabilityInternetClientSid,
+            WinCapabilityInternetClientSid, // confirmed to enable client sockets
+#if 0
             WinCapabilityInternetClientServerSid,
             WinCapabilityPrivateNetworkClientServerSid,
             WinCapabilityPicturesLibrarySid,
@@ -111,17 +115,18 @@ public:
             WinCapabilitySharedUserCertificatesSid,
             WinCapabilityEnterpriseAuthenticationSid,
             WinCapabilityRemovableStorageSid,
+#endif
         };
         for (auto cap : capabilities) {
             AddCapability(cap);
         }
-
         const wchar_t PROFILE_NAME[] = L"RunInSandbox.AppContainer";
         const wchar_t DISPLAY_NAME[] = L"RunInSandbox.AppContainer";
         const wchar_t DESCRIPTION[] = L"RunInSandbox AppContainer";
 
         // delete existing (if present)
         HRESULT hr = DeleteAppContainerProfile(PROFILE_NAME);
+        hr;
 
         if (FAILED(CreateAppContainerProfile(PROFILE_NAME, DISPLAY_NAME, DESCRIPTION,
             m_capabilities.empty() ? nullptr : m_capabilities.data(), (DWORD)m_capabilities.size(), &m_sid)))
@@ -168,17 +173,14 @@ private:
     std::vector<SID_AND_ATTRIBUTES> m_capabilities;
 };
 
-enum IMPERSONATE_MOE {
-    IMPERSONATE_USER,
-    IMPERSONATE_ANONYMOUS,
-};
 
 enum class IntegrityLevel {
     Default = 0,
     AppContainer = 1,            ///< dummy value to ease impl.
-    Low     = WinLowLabelSid,    ///< same as ConvertStringSidToSid("S-1-16-4096",..)
-    Medium  = WinMediumLabelSid, ///< same as ConvertStringSidToSid("S-1-16-8192",..)
-    High    = WinHighLabelSid,   ///< same as ConvertStringSidToSid("S-1-16-12288",..)
+    Untrusted = WinUntrustedLabelSid,///< same as ConvertStringSidToSid("S-1-16-0",..)
+    Low       = WinLowLabelSid,    ///< same as ConvertStringSidToSid("S-1-16-4096",..)
+    Medium    = WinMediumLabelSid, ///< same as ConvertStringSidToSid("S-1-16-8192",..)
+    High      = WinHighLabelSid,   ///< same as ConvertStringSidToSid("S-1-16-12288",..)
 };
 
 static std::wstring ToString (IntegrityLevel integrity) {
@@ -207,6 +209,33 @@ static IntegrityLevel FromString (std::wstring arg) {
     return IntegrityLevel::Default;
 }
 
+/** Tag a folder path as writable by low-integrity processes.
+By default, only %USER PROFILE%\AppData\LocalLow is writable.
+Based on "Designing Applications to Run at a Low Integrity Level" https://msdn.microsoft.com/en-us/library/bb625960.aspx */
+static DWORD MakePathLowIntegrity(std::wstring path) {
+    ACL * sacl = nullptr; // system access control list (weak ptr.)
+    PSECURITY_DESCRIPTOR SD = nullptr;
+    {
+        // initialize "low integrity" System Access Control List (SACL)
+        // Security Descriptor String interpretation: (based on sddl.h)
+        // SACL:(ace_type=Integrity label; ace_flags=; rights=SDDL_NO_WRITE_UP; object_guid=; inherit_object_guid=; account_sid=Low mandatory level)
+        WIN32_CHECK(ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;;NW;;;LW)", SDDL_REVISION_1, &SD, NULL));
+        BOOL sacl_present = FALSE;
+        BOOL sacl_defaulted = FALSE;
+        WIN32_CHECK(GetSecurityDescriptorSacl(SD, &sacl_present, &sacl, &sacl_defaulted));
+    }
+
+    // apply "low integrity" SACL
+    DWORD ret = SetNamedSecurityInfoW(const_cast<wchar_t*>(path.data()), SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION, /*owner*/NULL, /*group*/NULL, /*Dacl*/NULL, sacl);
+    LocalFree(SD);
+    if (ret == ERROR_SUCCESS)
+        return ret; // success
+
+                    // ERROR_FILE_NOT_FOUND ///< 2
+                    // ERROR_ACCESS_DENIED  ///< 5
+    return ret; // failure
+}
+
 
 /** RAII class for temporarily impersonating users & integrity levels for the current thread.
     Intended to be used together with CLSCTX_ENABLE_CLOAKING when creating COM objects. */
@@ -233,11 +262,12 @@ struct ImpersonateThread {
         WIN32_CHECK(ImpersonateLoggedOnUser(m_token)); // change current thread integrity
     }
 
-    ImpersonateThread(HandleWrap && token, IMPERSONATE_MOE mode) : m_token(std::move(token)) {
-        if (mode == IMPERSONATE_USER)
-            WIN32_CHECK(ImpersonateLoggedOnUser(m_token)); // change current thread integrity
-        else
-            WIN32_CHECK(ImpersonateAnonymousToken(m_token)); // change current thread integrity
+    ImpersonateThread(HandleWrap & handle) {
+        HandleWrap cur_token;
+        WIN32_CHECK(OpenProcessToken(handle, TOKEN_DUPLICATE | TOKEN_ADJUST_DEFAULT | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY, &cur_token));
+        WIN32_CHECK(DuplicateTokenEx(cur_token, 0, NULL, SecurityImpersonation, TokenPrimary, &m_token));
+
+        WIN32_CHECK(ImpersonateLoggedOnUser(m_token)); // change current thread integrity
     }
 
     ~ImpersonateThread() {
@@ -268,64 +298,55 @@ struct ImpersonateThread {
         WIN32_CHECK(SetTokenInformation(m_token, TokenIntegrityLevel, &TIL, sizeof(TOKEN_MANDATORY_LABEL) + GetLengthSid(li_sid)));
     }
 
+    /** Determine the integrity level for a process.
+    Based on https://github.com/chromium/chromium/blob/master/base/process/process_info_win.cc */
+    static IntegrityLevel GetProcessLevel(HANDLE process_token = GetCurrentProcessToken()) {
+        DWORD token_info_length = 0;
+        if (GetTokenInformation(process_token, TokenIntegrityLevel, NULL, 0, &token_info_length))
+            abort();
+
+        std::vector<char> token_info_buf(token_info_length);
+        auto* token_info = reinterpret_cast<TOKEN_MANDATORY_LABEL*>(token_info_buf.data());
+        if (!GetTokenInformation(process_token, TokenIntegrityLevel, token_info, token_info_length, &token_info_length))
+            abort();
+
+        DWORD integrity_level = *GetSidSubAuthority(token_info->Label.Sid, *GetSidSubAuthorityCount(token_info->Label.Sid) - 1);
+
+        if (integrity_level < SECURITY_MANDATORY_LOW_RID)
+            return IntegrityLevel::Untrusted;
+        if (integrity_level < SECURITY_MANDATORY_MEDIUM_RID)
+            return IntegrityLevel::Low;
+        else if (integrity_level < SECURITY_MANDATORY_HIGH_RID)
+            return IntegrityLevel::Medium;
+        else
+            return IntegrityLevel::High;
+    }
+
+    /** Check if a process is "elevated".
+        Please note that elevated processes might still run under medium or low integrity, so this is _not_ a reliable way of checking for administrative privileges. */
+    static bool IsProcessElevated (HANDLE process = GetCurrentProcess()) {
+        HandleWrap token;
+        if (!OpenProcessToken(process, TOKEN_QUERY, &token))
+            abort();
+
+        TOKEN_ELEVATION elevation = {};
+        DWORD ret_len = 0;
+        if (!GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &ret_len))
+            abort();
+
+        {
+            TOKEN_ELEVATION_TYPE elevation_type = {};
+            ret_len = 0;
+            if (!GetTokenInformation(token, TokenElevationType, &elevation_type, sizeof(elevation_type), &ret_len))
+                abort();
+
+            if (elevation.TokenIsElevated)
+                assert(elevation_type == TokenElevationTypeFull);
+        }
+
+        return elevation.TokenIsElevated;
+    }
+
     HandleWrap  m_token;
     PROFILEINFO m_profile = {};
 };
-
-
-/** Copied from https://github.com/chromium/chromium/blob/master/sandbox/win/src/nt_internals.h */
-typedef NTSTATUS(WINAPI* NtCreateLowBoxToken)(
-    OUT PHANDLE token,
-    IN HANDLE original_handle,
-    IN ACCESS_MASK access,
-    IN POBJECT_ATTRIBUTES object_attribute,
-    IN PSID appcontainer_sid,
-    IN DWORD capabilityCount,
-    IN PSID_AND_ATTRIBUTES capabilities,
-    IN DWORD handle_count,
-    IN PHANDLE handles);
-
-
-/** Create AppContainer "LowBox" token for security impersonation.
-    WARNING: Does not work yet!
-    Based on https://github.com/chromium/chromium/blob/master/sandbox/win/src/restricted_token_utils.cc */
-HandleWrap CreateLowBoxToken(HandleWrap& base_token, TOKEN_TYPE token_type, SECURITY_CAPABILITIES &sec_cap, std::vector<HANDLE>& saved_handles) {
-    // get NtCreateLowBoxToken function pointer (not ref-counted)
-    auto CreateLowBoxToken_fn = reinterpret_cast<NtCreateLowBoxToken>(GetProcAddress(GetModuleHandle(L"ntdll.dll"), "NtCreateLowBoxToken"));
-
-    if (!base_token)
-        WIN32_CHECK(OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &base_token));
-
-    OBJECT_ATTRIBUTES obj_attr = {};
-    InitializeObjectAttributes(&obj_attr, nullptr, 0, nullptr, nullptr);
-
-    HandleWrap token_lowbox;
-    NTSTATUS status = CreateLowBoxToken_fn(&token_lowbox, base_token, TOKEN_ALL_ACCESS, &obj_attr, sec_cap.AppContainerSid, sec_cap.CapabilityCount, sec_cap.Capabilities, (DWORD)saved_handles.size(), saved_handles.data());
-    if (!NT_SUCCESS(status)) {
-        _com_error error(HRESULT_FROM_NT(status));
-        abort();
-    }
-    if (token_lowbox == 0 || token_lowbox == INVALID_HANDLE_VALUE) {
-        std::cerr << "CreateLowBoxToken returned invalid token\n";
-        abort();
-    }
-
-    // Default from NtCreateLowBoxToken is a Primary token.
-    if (token_type == TokenPrimary)
-        return token_lowbox;
-
-    HandleWrap token_for_sd;
-    WIN32_CHECK(DuplicateTokenEx(token_lowbox, TOKEN_ALL_ACCESS, nullptr, SecurityImpersonation, TokenImpersonation, &token_for_sd));
-
-    // Copy security descriptor from primary token as the new object will have DACL from the current token's default DACL.
-    {
-        DWORD length_needed = 0;
-        WIN32_CHECK(GetKernelObjectSecurity(token_lowbox, DACL_SECURITY_INFORMATION, nullptr, 0, &length_needed), ERROR_INSUFFICIENT_BUFFER);
-        std::vector<unsigned char> sec_desc_buffer(length_needed);
-        WIN32_CHECK(GetKernelObjectSecurity(token_lowbox, DACL_SECURITY_INFORMATION, reinterpret_cast<PSECURITY_DESCRIPTOR>(sec_desc_buffer.data()), length_needed, &length_needed));
-
-        WIN32_CHECK(SetKernelObjectSecurity(token_for_sd, DACL_SECURITY_INFORMATION, reinterpret_cast<PSECURITY_DESCRIPTOR>(sec_desc_buffer.data())));
-    }
-
-    return token_for_sd;
-}

@@ -13,16 +13,17 @@ class ATL_NO_VTABLE TestControl :
     public ISimpleCalculator
 {
 public:
-    TestControl(){
-    }
+    TestControl();
 
-    /*NOT virtual*/ ~TestControl() {
-    }
+    /*NOT virtual*/ ~TestControl();
 
-    HRESULT STDMETHODCALLTYPE Add(int a, int b, int * sum) override {
-        *sum = a + b;
-        return S_OK;
-    }
+    HRESULT STDMETHODCALLTYPE Add(int a, int b, int * sum) override;
+
+    HRESULT STDMETHODCALLTYPE IsElevated (/*out*/BOOL * is_elevated, /*out*/BOOL * high_integrity) override;
+
+    HRESULT STDMETHODCALLTYPE TestNetworkConnection (/*in*/BSTR host, USHORT port, /*out*/BOOL * can_access) override;
+
+    HRESULT STDMETHODCALLTYPE CreateInstance (BOOL elevated, CLSID clsid, /*out*/IUnknown ** obj) override;
 
     DECLARE_REGISTRY_RESOURCEID(IDR_TestControl)
 
@@ -30,10 +31,11 @@ public:
         COM_INTERFACE_ENTRY(ISimpleCalculator)
     END_COM_MAP()
 
+#if 0
     BEGIN_CATEGORY_MAP(TestControl)
         IMPLEMENTED_CATEGORY(CATID_AppContainerCompatible)
     END_CATEGORY_MAP()
-private:
+#endif
 };
 
 OBJECT_ENTRY_AUTO(CLSID_TestControl, TestControl)

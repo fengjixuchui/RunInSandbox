@@ -6,6 +6,33 @@
 #define DEBUG_COM_ACTIVATION
 
 
+std::wstring GetLocalServerPath (CLSID clsid) {
+    // build registry path
+    CComBSTR reg_path(L"CLSID\\");
+    reg_path.Append(clsid);
+    reg_path.Append(L"\\LocalServer32");
+
+    // extract COM class
+    CRegKey cls_reg;
+    if (cls_reg.Open(HKEY_CLASSES_ROOT, reg_path, KEY_READ) != ERROR_SUCCESS)
+        return L"";
+
+    ULONG    exe_path_len = 0;
+    if (cls_reg.QueryStringValue(nullptr, nullptr, &exe_path_len) != ERROR_SUCCESS)
+        return L"";
+
+    std::wstring exe_path(exe_path_len, L'\0');
+    if (cls_reg.QueryStringValue(nullptr, const_cast<wchar_t*>(exe_path.data()), &exe_path_len) != ERROR_SUCCESS)
+        return L"";
+    exe_path.resize(exe_path_len-1); // remove extra zero-termination
+
+    if (exe_path[0] == '"')
+        exe_path = exe_path.substr(1, exe_path.size()-2); // remove quotes
+
+    return exe_path;
+}
+
+
 /** Attempt to create a COM server that runds through a specific user account.
     NOTICE: Non-admin users need to be granted local DCOM "launch" and "activation" permission to the DCOM object to prevent E_ACCESSDENIED (General access denied error). Unfortunately, creation still fails with CO_E_SERVER_EXEC_FAILURE.
 
@@ -13,28 +40,16 @@
     REF: https://stackoverflow.com/questions/54076028/dcom-registration-timeout-when-attempting-to-start-a-com-server-through-a-differ */
 CComPtr<IUnknown> CoCreateAsUser_impersonate (CLSID clsid, IntegrityLevel mode, wchar_t* user, wchar_t* passwd) {
     std::unique_ptr<ImpersonateThread> impersonate;
-    if (mode != IntegrityLevel::AppContainer) {
+    bool implicit_process_create = true;
+    if (implicit_process_create && (mode != IntegrityLevel::AppContainer)) {
         // impersonate a different user
         impersonate.reset(new ImpersonateThread(user, passwd, mode));
     } else {
-        // impersonate an AppContainer
-#if 0
-        // WARNING: Does not work. CoCreateInstance will fail with E_OUTOFMEMORY
-        AppContainerWrap ac;
-        SECURITY_CAPABILITIES sec_cap = ac.SecCap();
-        std::vector<HANDLE> saved_handles;
-        HandleWrap base_token;
-        HandleWrap ac_token = CreateLowBoxToken(base_token, TokenImpersonation, sec_cap, saved_handles);
-        impersonate.reset(new ImpersonateThread(std::move(ac_token), IMPERSONATE_USER));
-#else
-        // launch notepad in an AppContainer process.
-        // This is really overkill, since we only need the thread token
-        ProcessHandles token = ProcCreate(L"C:\\Windows\\System32\\notepad.exe", IntegrityLevel::AppContainer, 0, nullptr);
-
-        // impersonate the notepad thread
-        // WARNING: AppContainer property is _not_ propagated when calling CoCreateInstance
-        impersonate.reset(new ImpersonateThread(std::move(token.thread), IMPERSONATE_ANONYMOUS));
-#endif
+        // launch process in an AppContainer process.
+        std::wstring exe_path = GetLocalServerPath(clsid);
+        HandleWrap proc = ProcCreate(exe_path.c_str(), mode, true, 0, nullptr);
+        // impersonate the process thread
+        impersonate.reset(new ImpersonateThread(proc));
     }
 
     CComPtr<IUnknown> obj;
@@ -110,20 +125,27 @@ CComPtr<IUnknown> CoCreateAsUser_dcom(CLSID clsid, wchar_t* user, wchar_t* passw
 /** Create a AppID and elevation-enabled COM server in a admin process.
     REF: https://docs.microsoft.com/en-us/windows/win32/com/the-com-elevation-moniker */
 template <typename T>
-static CComPtr<T> CoCreateInstanceAsAdmin (HWND window, const IID & classId) {
+static HRESULT CoCreateInstanceElevated (HWND window, const IID & classId, T ** result) {
+    if (!result)
+        return E_INVALIDARG;
+    if (*result)
+        return E_INVALIDARG;
+
     std::wstring name;
     name.resize(39);
-    CHECK(::StringFromGUID2(classId, const_cast<wchar_t*>(name.data()), static_cast<int>(name.size())));
+    HRESULT hr = ::StringFromGUID2(classId, const_cast<wchar_t*>(name.data()), static_cast<int>(name.size()));
+    if (FAILED(hr))
+        return hr;
     name = L"Elevation:Administrator!new:" + name;
+
+    std::wcout << L"CoGetObject: " << name << L'\n';
 
     BIND_OPTS3 options = {};
     options.cbStruct = sizeof(options);
     options.hwnd = window;
     options.dwClassContext = CLSCTX_LOCAL_SERVER;
 
-    CComPtr<T> obj;
-    CHECK(::CoGetObject(name.c_str(), &options, __uuidof(T), reinterpret_cast<void**>(&obj)));
-    return obj;
+    return ::CoGetObject(name.c_str(), &options, __uuidof(T), reinterpret_cast<void**>(result));
 }
 
 

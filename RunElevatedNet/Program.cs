@@ -18,13 +18,23 @@ namespace RunElevatedNet
                 return 1;
             }
 
+            string arg = args[0];
+
+            if (arg.Substring(0,4) == "http")
+            {
+                System.Console.WriteLine(String.Format("Opening URL {0} in a web browser.", arg));
+                if (!OpenBrowser(arg))
+                    System.Console.WriteLine("ERROR: Unable to open web browser");
+                return 0;
+            }
+
             // check if argument is a COM class
-            Type comCls = Type.GetTypeFromProgID(args[0]); // e.g. HNetCfg.FwPolicy2
+            Type comCls = Type.GetTypeFromProgID(arg); // e.g. HNetCfg.FwPolicy2
 
             if (comCls == null) {
                 // argument is _not_ a COM CLSID, so assume that it's a EXE instead
                 System.Console.WriteLine("Starting {0} in an elevated (admin) process...");
-                ProcessStartInfo startInfo = new ProcessStartInfo(args[0]);
+                ProcessStartInfo startInfo = new ProcessStartInfo(arg);
                 startInfo.Verb = "runas"; // activate elevated invocation
                 System.Diagnostics.Process.Start(startInfo);
                 System.Console.WriteLine("[success]");
@@ -36,7 +46,7 @@ namespace RunElevatedNet
             object obj = null;
             if (launch_elevated) {
                 System.Console.WriteLine("Creating an elevated (admin) COM class instance...");
-                obj = CoCreateInstanceAsAdmin((IntPtr)0, comCls); // elevated
+                obj = CoCreateInstanceElevated((IntPtr)0, comCls); // elevated
             } else {
                 System.Console.WriteLine("Creating a non-elevated (regular) COM class instance...");
                 obj = Activator.CreateInstance(comCls); // non-elevated
@@ -55,6 +65,27 @@ namespace RunElevatedNet
             return 0;
         }
 
+        /** Open a webpage using the default web browser. 
+         * REF: https://github.com/googleapis/google-api-dotnet-client/pull/1553 */
+        static bool OpenBrowser(string url)
+        {
+            System.Console.WriteLine("WARNING: Does not seem to work in low integrity.");
+#if false
+            Process proc = Process.Start(url);
+#else
+            // See https://stackoverflow.com/a/6040946/44360 for why this is required
+            url = System.Text.RegularExpressions.Regex.Replace(url, @"(\\*)" + "\"", @"$1$1\" + "\"");
+            url = System.Text.RegularExpressions.Regex.Replace(url, @"(\\+)$", @"$1$1");
+            Process proc = Process.Start(new ProcessStartInfo($"\"{url}\"") { CreateNoWindow = true });
+#endif
+
+            // check if process exits surprisingly fast
+            if (proc.WaitForExit(1000))
+            {
+                return (proc.ExitCode == 0);
+            }
+            return true;
+        }
 
         /** This function will be triggered if creating the "HNetCfg.FwPolicy2" COM class. */
         static void TestFirewall (INetFwPolicy2 firewallPolicy)
@@ -105,7 +136,7 @@ namespace RunElevatedNet
 
         /** C# port of COM Elevation Moniker sample in https://docs.microsoft.com/en-us/windows/win32/com/the-com-elevation-moniker */
         [return: MarshalAs(UnmanagedType.Interface)]
-        static object CoCreateInstanceAsAdmin(IntPtr parentWindow, Type comClass)
+        static object CoCreateInstanceElevated(IntPtr parentWindow, Type comClass)
         {
             // B formatting directive: returns {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx} 
             var monikerName = "Elevation:Administrator!new:" + comClass.GUID.ToString("B");
