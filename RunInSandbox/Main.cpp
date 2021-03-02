@@ -13,7 +13,7 @@
 int wmain (int argc, wchar_t *argv[]) {
     if (argc < 2) {
         std::wcerr << L"Too few arguments\n.";
-        std::wcerr << L"Usage: RunInSandbox.exe [ac|li|mi|hi] ProgID [username] [password]\n";
+        std::wcerr << L"Usage: RunInSandbox.exe [ac|li|mi|hi] ProgID [-g]\n";
         std::wcerr << L"Usage: RunInSandbox.exe [ac|li|mi|hi] ExePath|URL\n";
         return -1;
     }
@@ -28,18 +28,20 @@ int wmain (int argc, wchar_t *argv[]) {
     std::wstring progid = argv[arg_idx];
     bool progid_provided = SUCCEEDED(CLSIDFromProgID(progid.c_str(), &clsid));
     bool url_provided = std::wstring(argv[arg_idx]).substr(0, 4) == L"http";
+    arg_idx++;
+
+    bool grant_appcontainer_permissions = false;
+    if (arg_idx < argc) {
+        if (std::wstring(argv[arg_idx]) == L"-g") {
+            grant_appcontainer_permissions = true;
+            arg_idx++;
+        }
+    }
 
     if (progid_provided) {
         // initialize multi-threaded COM apartment
         if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED)))
             abort();
-
-    #if 0
-        // attempt to disable COM security and enable cloaking
-        HRESULT hr = CoInitializeSecurity(nullptr, -1/*auto*/, nullptr, NULL, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE /*EOAC_STATIC_CLOAKING*/, NULL);
-        if (FAILED(hr))
-            abort();
-    #endif
 
         std::wcout << L"Creating COM object " << progid << L" in " << ToString(mode).c_str() << L"...\n";
 
@@ -50,11 +52,7 @@ int wmain (int argc, wchar_t *argv[]) {
             CHECK(CoCreateInstanceElevated<IUnknown>(0, clsid, &obj));
             std::wcout << L"COM server sucessfully created in elevated process.\n";
         } else {
-            arg_idx++;
-            wchar_t* user = (argc > arg_idx) ? argv[arg_idx++] : nullptr;
-            wchar_t* pw = (argc > arg_idx) ? argv[arg_idx++] : nullptr;
-            obj = CoCreateAsUser_impersonate(clsid, mode, user, pw);
-            //CComPtr<IUnknown> obj = CoCreateAsUser_dcom(clsid, user, pw);
+            obj = CoCreateAsUser_impersonate(clsid, mode, grant_appcontainer_permissions);
         }
 
         // try to add two numbers
@@ -109,9 +107,11 @@ int wmain (int argc, wchar_t *argv[]) {
         }
     } else {
         std::wcout << L"Starting executable " << progid << L" in " << ToString(mode).c_str() << L"...\n";
+        std::vector<std::wstring> args;
+        for (; arg_idx < argc; ++arg_idx)
+            args.push_back(argv[arg_idx]);
 
-        int extra_args = argc - arg_idx - 1;
-        ProcCreate(progid.c_str(), mode, false, extra_args, extra_args > 0 ? &argv[arg_idx+1] : nullptr);
+        ProcCreate(progid.c_str(), mode, args);
     }
 
     std::wcout << L"[done]" << std::endl;

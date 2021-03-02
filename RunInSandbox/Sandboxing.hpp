@@ -2,6 +2,7 @@
 #include <cassert>
 #include <vector>
 #include <Windows.h>
+#include <atlbase.h>
 #include <comdef.h>
 #include <versionhelpers.h>
 #include <aclapi.h> // for SE_FILE_OBJECT
@@ -11,13 +12,11 @@
 #include <Winternl.h>
 
 
-static void WIN32_CHECK(BOOL res, DWORD whitelisted_err = ERROR_SUCCESS) {
+static void WIN32_CHECK(BOOL res) {
     if (res)
         return;
 
     DWORD code = GetLastError();
-    if (code == whitelisted_err)
-        return;
 
     _com_error error(code);
     std::wcout << L"ERROR: " << error.ErrorMessage() << std::endl;
@@ -68,21 +67,28 @@ private:
 static_assert(sizeof(HandleWrap) == sizeof(HANDLE), "HandleWrap size mismatch");
 
 
+/** RAII wrapper of Win32 Security IDentifier (SID) handles. */
 class SidWrap {
 public:
     SidWrap() {
     }
     ~SidWrap() {
+        Clear();
+    }
+
+    void Clear() {
         if (sid) {
             FreeSid(sid);
             sid = nullptr;
         }
     }
 
-    void Allocate(DWORD size) {
-        SidWrap::~SidWrap();
-        new(this) SidWrap();
-        sid = LocalAlloc(LPTR, size);
+    void Create(WELL_KNOWN_SID_TYPE type) {
+        assert(!sid);
+
+        DWORD sid_size = SECURITY_MAX_SID_SIZE;
+        sid = LocalAlloc(LPTR, sid_size);
+        WIN32_CHECK(CreateWellKnownSid(type, nullptr, sid, &sid_size));
     }
 
     operator PSID () {
@@ -93,19 +99,52 @@ public:
     }
 
 protected:
+    SidWrap (const SidWrap &) = delete;
+    SidWrap& operator = (const SidWrap &) = delete;
+
     PSID sid = nullptr;
 };
 static_assert(sizeof(SidWrap) == sizeof(PSID), "SidWrap size mismatch");
 
 
+/** RAII wrapper of Win32 API objects allocated with LocalAlloc. */
+template <class T>
+class LocalWrap {
+public:
+    LocalWrap() {
+    }
+    ~LocalWrap() {
+        if (obj) {
+            LocalFree(obj);
+            obj = nullptr;
+        }
+    }
+
+    operator T () {
+        return obj;
+    }
+    T* operator & () {
+        return &obj;
+    }
+
+private:
+    LocalWrap(const LocalWrap &) = delete;
+    LocalWrap& operator = (const LocalWrap &) = delete;
+
+    T obj = nullptr;
+};
+
+
 /** RAII class for encapsulating AppContainer configuration. */
 class AppContainerWrap {
 public:
-    AppContainerWrap() {
+    AppContainerWrap(const wchar_t * name, const wchar_t * desc) {
         // https://docs.microsoft.com/en-us/windows/uwp/packaging/app-capability-declarations
+        // https://docs.microsoft.com/en-us/windows/win32/api/winnt/ne-winnt-well_known_sid_type
         const WELL_KNOWN_SID_TYPE capabilities[] = {
             WinCapabilityInternetClientSid, // confirmed to enable client sockets
 #if 0
+            WinCapabilityRemovableStorageSid, // have been unable to get this to work (see https://github.com/M2Team/Privexec/issues/31 for more info)
             WinCapabilityInternetClientServerSid,
             WinCapabilityPrivateNetworkClientServerSid,
             WinCapabilityPicturesLibrarySid,
@@ -114,34 +153,24 @@ public:
             WinCapabilityDocumentsLibrarySid,
             WinCapabilitySharedUserCertificatesSid,
             WinCapabilityEnterpriseAuthenticationSid,
-            WinCapabilityRemovableStorageSid,
 #endif
         };
-        for (auto cap : capabilities) {
+        for (auto cap : capabilities)
             AddCapability(cap);
-        }
-        const wchar_t PROFILE_NAME[] = L"RunInSandbox.AppContainer";
-        const wchar_t DISPLAY_NAME[] = L"RunInSandbox.AppContainer";
-        const wchar_t DESCRIPTION[] = L"RunInSandbox AppContainer";
 
         // delete existing (if present)
-        HRESULT hr = DeleteAppContainerProfile(PROFILE_NAME);
+        HRESULT hr = DeleteAppContainerProfile(name);
         hr;
 
-        if (FAILED(CreateAppContainerProfile(PROFILE_NAME, DISPLAY_NAME, DESCRIPTION,
+        if (FAILED(CreateAppContainerProfile(name, name, desc,
             m_capabilities.empty() ? nullptr : m_capabilities.data(), (DWORD)m_capabilities.size(), &m_sid)))
             abort();
     }
 
     ~AppContainerWrap() {
-        if (m_sid) {
-            FreeSid(m_sid);
-            m_sid = nullptr;
-        }
-
         for (auto &c : m_capabilities) {
             if (c.Sid) {
-                FreeSid(c.Sid);
+                free(c.Sid);
                 c.Sid = nullptr;
             }
         }
@@ -158,10 +187,7 @@ public:
     }
 
     void AddCapability(WELL_KNOWN_SID_TYPE capability) {
-        PSID sid = LocalAlloc(LPTR, SECURITY_MAX_SID_SIZE);
-        if (sid == nullptr)
-            abort();
-
+        PSID sid = malloc(SECURITY_MAX_SID_SIZE); // freed in destructor
         DWORD sidListSize = SECURITY_MAX_SID_SIZE;
         WIN32_CHECK(CreateWellKnownSid(capability, NULL, sid, &sidListSize));
 
@@ -169,7 +195,7 @@ public:
     }
 
 private:
-    PSID                            m_sid = nullptr;
+    SidWrap                         m_sid;
     std::vector<SID_AND_ATTRIBUTES> m_capabilities;
 };
 
@@ -209,47 +235,109 @@ static IntegrityLevel FromString (std::wstring arg) {
     return IntegrityLevel::Default;
 }
 
-/** Tag a folder path as writable by low-integrity processes.
-By default, only %USER PROFILE%\AppData\LocalLow is writable.
-Based on "Designing Applications to Run at a Low Integrity Level" https://msdn.microsoft.com/en-us/library/bb625960.aspx */
-static DWORD MakePathLowIntegrity(std::wstring path) {
-    ACL * sacl = nullptr; // system access control list (weak ptr.)
-    PSECURITY_DESCRIPTOR SD = nullptr;
-    {
-        // initialize "low integrity" System Access Control List (SACL)
-        // Security Descriptor String interpretation: (based on sddl.h)
-        // SACL:(ace_type=Integrity label; ace_flags=; rights=SDDL_NO_WRITE_UP; object_guid=; inherit_object_guid=; account_sid=Low mandatory level)
-        WIN32_CHECK(ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;;NW;;;LW)", SDDL_REVISION_1, &SD, NULL));
-        BOOL sacl_present = FALSE;
-        BOOL sacl_defaulted = FALSE;
-        WIN32_CHECK(GetSecurityDescriptorSacl(SD, &sacl_present, &sacl, &sacl_defaulted));
+
+class Permissions {
+public:
+    /** Tag a folder path as writable by low-integrity processes.
+        By default, only %USER PROFILE%\AppData\LocalLow is writable.
+        Based on "Designing Applications to Run at a Low Integrity Level" https://docs.microsoft.com/en-us/previous-versions/dotnet/articles/bb625960(v%3dmsdn.10)
+        Equivalent to "icacls.exe  <path> /setintegritylevel Low"
+
+    Limitations when running under medium integrity (e.g. from a non-admin command prompt):
+    * Will fail if only the "Administrators" group have full access to the path, even if the current user is a member of that group.
+    * Requires either the current user or the "Users" group to be granted full access to the path. */
+    static DWORD MakePathLowIntegrity(const wchar_t * path) {
+        ACL * sacl = nullptr; // system access control list (weak ptr.)
+        LocalWrap<PSECURITY_DESCRIPTOR> SD; // must outlive SetNamedSecurityInfo to avoid sporadic failures
+        {
+            // initialize "low integrity" System Access Control List (SACL)
+            // Security Descriptor String interpretation: (based on sddl.h)
+            // SACL:(ace_type=Mandatory integrity Label (ML); ace_flags=; rights=SDDL_NO_WRITE_UP (NW); object_guid=; inherit_object_guid=; account_sid=Low mandatory level (LW))
+            WIN32_CHECK(ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;;NW;;;LW)", SDDL_REVISION_1, &SD, NULL));
+            BOOL sacl_present = FALSE;
+            BOOL sacl_defaulted = FALSE;
+            WIN32_CHECK(GetSecurityDescriptorSacl(SD, &sacl_present, &sacl, &sacl_defaulted));
+        }
+
+        // apply "low integrity" SACL
+        DWORD ret = SetNamedSecurityInfoW(const_cast<wchar_t*>(path), SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION, /*owner*/NULL, /*group*/NULL, /*Dacl*/NULL, sacl);
+        return ret; // ERROR_SUCCESS on success
     }
 
-    // apply "low integrity" SACL
-    DWORD ret = SetNamedSecurityInfoW(const_cast<wchar_t*>(path.data()), SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION, /*owner*/NULL, /*group*/NULL, /*Dacl*/NULL, sacl);
-    LocalFree(SD);
-    if (ret == ERROR_SUCCESS)
-        return ret; // success
 
-                    // ERROR_FILE_NOT_FOUND ///< 2
-                    // ERROR_ACCESS_DENIED  ///< 5
-    return ret; // failure
-}
+    /** Make file/folder accessible from a given AppContainer.
+        Based on https://github.com/zodiacon/RunAppContainer/blob/master/RunAppContainer/RunAppContainerDlg.cpp */
+    static DWORD MakePathAppContainer(const wchar_t * ac_str_sid, const wchar_t * path, ACCESS_MASK accessMask = FILE_ALL_ACCESS) {
+        // convert string SID to binary
+        SidWrap ac_sid;
+        WIN32_CHECK(ConvertStringSidToSid(ac_str_sid, &ac_sid));
+
+        EXPLICIT_ACCESSW access = {};
+        {
+            access.grfAccessPermissions = accessMask;
+            access.grfAccessMode = GRANT_ACCESS;
+            access.grfInheritance = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+            access.Trustee.pMultipleTrustee = nullptr;
+            access.Trustee.MultipleTrusteeOperation = NO_MULTIPLE_TRUSTEE;
+            access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+            access.Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+            access.Trustee.ptstrName = (wchar_t*)*&ac_sid;
+        }
+
+        ACL * prevAcl = nullptr; // weak ptr.
+        DWORD status = GetNamedSecurityInfoW(const_cast<wchar_t*>(path), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, /*DACL*/&prevAcl, nullptr, nullptr);
+        if (status != ERROR_SUCCESS)
+            return status;
+
+        LocalWrap<ACL*> newAcl; // owning ptr.
+        status = SetEntriesInAclW(1, &access, prevAcl, &newAcl);
+        if (status != ERROR_SUCCESS)
+            return status;
+
+        status = SetNamedSecurityInfoW(const_cast<wchar_t*>(path), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, /*DACL*/newAcl, nullptr);
+        return status; // ERROR_SUCCESS on success
+    }
+
+
+    /** Enable DCOM launch & activation requests for a given AppContainer SID.
+        TODO: Append ACL instead of replacing it. */
+    static LSTATUS EnableLaunchActPermission (const wchar_t* ac_str_sid, const wchar_t* app_id) {
+        // Allow World Local Launch/Activation permissions. Label the SD for LOW IL Execute UP
+        // REF: https://docs.microsoft.com/en-us/windows/win32/secauthz/security-descriptor-string-format
+        // REF: https://docs.microsoft.com/en-us/windows/win32/com/access-control-lists-for-com
+        std::wstring ac_access = L"O:BA";// Owner: Built-in administrators (BA)
+        ac_access += L"G:BA";            // Group: Built-in administrators (BA)
+        ac_access += L"D:(A;;0xb;;;WD)"; // DACL: (ace_type=Allow (A); ace_flags=; rights=ACTIVATE_LOCAL | EXECUTE_LOCAL | EXECUTE (0xb); object_guid=; inherit_object_guid=; account_sid=Everyone (WD))
+        ac_access += L"(A;;0xb;;;";
+        ac_access +=             ac_str_sid;
+        ac_access +=                     L")"; // (ace_type=Allow (A); ace_flags=; rights=ACTIVATE_LOCAL | EXECUTE_LOCAL | EXECUTE (0xb); object_guid=; inherit_object_guid=; account_sid=ac_str_sid)
+        ac_access += L"S:(ML;;NX;;;LW)"; // SACL:(ace_type=Mandatory Label (ML); ace_flags=; rights=No Execute Up (NX); object_guid=; inherit_object_guid=; account_sid=Low mandatory level (LW))
+        LocalWrap<PSECURITY_DESCRIPTOR> ac_sd;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(ac_access.c_str(), SDDL_REVISION_1, &ac_sd, NULL))
+            abort();
+
+        // open registry path
+        CComBSTR reg_path(L"AppID\\");
+        reg_path.Append(app_id);
+
+        CRegKey appid_reg;
+        if (appid_reg.Open(HKEY_CLASSES_ROOT, reg_path, KEY_READ | KEY_WRITE) != ERROR_SUCCESS)
+            abort();
+
+        // Set AppID LaunchPermission registry key to grant appContainer local launch & activation permission
+        // REF: https://docs.microsoft.com/en-us/windows/win32/com/launchpermission
+        DWORD dwLen = GetSecurityDescriptorLength(ac_sd);
+        LSTATUS lResult = appid_reg.SetBinaryValue(L"LaunchPermission", (BYTE*)*&ac_sd, dwLen);
+        return lResult;
+    }
+};
 
 
 /** RAII class for temporarily impersonating users & integrity levels for the current thread.
     Intended to be used together with CLSCTX_ENABLE_CLOAKING when creating COM objects. */
 struct ImpersonateThread {
-    ImpersonateThread(const wchar_t* user, const wchar_t* passwd, IntegrityLevel integrity) {
-        if (user && passwd) {
-            // impersonate a different user
-            WIN32_CHECK(LogonUser(user, L""/*domain*/, passwd, LOGON32_LOGON_BATCH, LOGON32_PROVIDER_DEFAULT, &m_token));
-
-            // load associated user profile (doesn't work for current user)
-            m_profile.dwSize = sizeof(m_profile);
-            m_profile.lpUserName = const_cast<wchar_t*>(user);
-            //WIN32_CHECK(LoadUserProfile(m_token, &m_profile));
-        } else {
+    ImpersonateThread(IntegrityLevel integrity) {
+        {
             // current user
             HandleWrap cur_token;
             WIN32_CHECK(OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_ADJUST_DEFAULT | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY, &cur_token));
@@ -271,31 +359,22 @@ struct ImpersonateThread {
     }
 
     ~ImpersonateThread() {
-        if (m_profile.lpUserName) {
-            // TODO: Defer profile unloading
-            //WIN32_CHECK(UnloadUserProfile(m_token, &m_profile));
-        }
-
         WIN32_CHECK(RevertToSelf());
     }
 
-    /** Create a low-integrity token associated with the current user.
-        Based on "Designing Applications to Run at a Low Integrity Level" https://msdn.microsoft.com/en-us/library/bb625960.aspx */
+    /** Adjust integrity level for the impersonation token.
+        Based on "Designing Applications to Run at a Low Integrity Level" https://docs.microsoft.com/en-us/previous-versions/dotnet/articles/bb625960(v%3dmsdn.10) */
     void ApplyIntegrity(IntegrityLevel integrity) {
         assert(integrity != IntegrityLevel::AppContainer);
 
-        SidWrap li_sid;
-        {
-            DWORD sid_size = SECURITY_MAX_SID_SIZE;
-            li_sid.Allocate(sid_size);
-            WIN32_CHECK(CreateWellKnownSid(static_cast<WELL_KNOWN_SID_TYPE>(integrity), nullptr, li_sid, &sid_size));
-        }
+        SidWrap impersonation_sid;
+        impersonation_sid.Create(static_cast<WELL_KNOWN_SID_TYPE>(integrity));
 
         // reduce process integrity level
         TOKEN_MANDATORY_LABEL TIL = {};
         TIL.Label.Attributes = SE_GROUP_INTEGRITY;
-        TIL.Label.Sid = li_sid;
-        WIN32_CHECK(SetTokenInformation(m_token, TokenIntegrityLevel, &TIL, sizeof(TOKEN_MANDATORY_LABEL) + GetLengthSid(li_sid)));
+        TIL.Label.Sid = impersonation_sid;
+        WIN32_CHECK(SetTokenInformation(m_token, TokenIntegrityLevel, &TIL, sizeof(TOKEN_MANDATORY_LABEL) + GetLengthSid(impersonation_sid)));
     }
 
     /** Determine the integrity level for a process.
@@ -348,5 +427,4 @@ struct ImpersonateThread {
     }
 
     HandleWrap  m_token;
-    PROFILEINFO m_profile = {};
 };

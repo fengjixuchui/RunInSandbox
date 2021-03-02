@@ -1,55 +1,104 @@
 #pragma once
 #include "Sandboxing.hpp"
 #include "ProcCreate.hpp"
-#include <atlbase.h>
+#include <tuple>
 #include "../TestControl/ComSupport.hpp"
-#define DEBUG_COM_ACTIVATION
+//#define DEBUG_COM_ACTIVATION
 
-
-std::wstring GetLocalServerPath (CLSID clsid) {
+/** Returns the COM EXE path and AppID GIUD string. */
+static std::tuple<std::wstring,std::wstring> GetLocalServerPath (CLSID clsid, REGSAM bitness = 0/*same bitness as client*/) {
     // build registry path
-    CComBSTR reg_path(L"CLSID\\");
-    reg_path.Append(clsid);
-    reg_path.Append(L"\\LocalServer32");
+    CComBSTR clsid_path(L"CLSID\\");
+    clsid_path.Append(clsid);
 
-    // extract COM class
-    CRegKey cls_reg;
-    if (cls_reg.Open(HKEY_CLASSES_ROOT, reg_path, KEY_READ) != ERROR_SUCCESS)
-        return L"";
+    std::wstring exe_path;
+    {
+        CComBSTR local_server_path = clsid_path;
+        local_server_path.Append(L"\\LocalServer32");
 
-    ULONG    exe_path_len = 0;
-    if (cls_reg.QueryStringValue(nullptr, nullptr, &exe_path_len) != ERROR_SUCCESS)
-        return L"";
+        // extract COM class
+        CRegKey cls_reg;
+        if (cls_reg.Open(HKEY_CLASSES_ROOT, local_server_path, KEY_READ | bitness) != ERROR_SUCCESS)
+            return {L"", L""};
 
-    std::wstring exe_path(exe_path_len, L'\0');
-    if (cls_reg.QueryStringValue(nullptr, const_cast<wchar_t*>(exe_path.data()), &exe_path_len) != ERROR_SUCCESS)
-        return L"";
-    exe_path.resize(exe_path_len-1); // remove extra zero-termination
+        ULONG exe_path_len = 0;
+        if (cls_reg.QueryStringValue(nullptr, nullptr, &exe_path_len) != ERROR_SUCCESS)
+            return {L"", L""};
 
-    if (exe_path[0] == '"')
-        exe_path = exe_path.substr(1, exe_path.size()-2); // remove quotes
+        exe_path.resize(exe_path_len, L'\0');
+        if (cls_reg.QueryStringValue(nullptr, const_cast<wchar_t*>(exe_path.data()), &exe_path_len) != ERROR_SUCCESS)
+            return {L"", L""};
+        exe_path.resize(exe_path_len - 1); // remove extra zero-termination
 
-    return exe_path;
+        if (exe_path[0] == '"')
+            exe_path = exe_path.substr(1, exe_path.size() - 2); // remove quotes
+
+        // remove "/automation" (or other) argument if present
+        size_t idx = exe_path.find(L" /");
+        if (idx != exe_path.npos)
+            exe_path = exe_path.substr(0, idx);
+    }
+
+    std::wstring app_id;
+    if (!exe_path.empty()){
+        // extract COM class
+        CRegKey cls_reg;
+        if (cls_reg.Open(HKEY_CLASSES_ROOT, clsid_path, KEY_READ | bitness) != ERROR_SUCCESS)
+            abort();
+
+        ULONG app_id_len = 0;
+        if (cls_reg.QueryStringValue(L"AppID", nullptr, &app_id_len) != ERROR_SUCCESS)
+            abort();
+
+        app_id.resize(app_id_len, L'\0');
+        if (cls_reg.QueryStringValue(L"AppID", const_cast<wchar_t*>(app_id.data()), &app_id_len) != ERROR_SUCCESS)
+            abort();
+        app_id.resize(app_id_len - 1); // remove extra zero-termination
+    }
+
+    if (exe_path.empty() && (bitness == 0))
+        std::tie(exe_path, app_id) = GetLocalServerPath(clsid, KEY_WOW64_32KEY); // fallback to 32bit part of registry
+
+    return std::tie(exe_path,app_id);
 }
 
 
 /** Attempt to create a COM server that runds through a specific user account.
-    NOTICE: Non-admin users need to be granted local DCOM "launch" and "activation" permission to the DCOM object to prevent E_ACCESSDENIED (General access denied error). Unfortunately, creation still fails with CO_E_SERVER_EXEC_FAILURE.
-
-    WARNING: Does not seem to work. The process is launched with the correct user, but crashes immediately. Might be caused by incorrect env. vars. inherited from the parent process.
-    REF: https://stackoverflow.com/questions/54076028/dcom-registration-timeout-when-attempting-to-start-a-com-server-through-a-differ */
-CComPtr<IUnknown> CoCreateAsUser_impersonate (CLSID clsid, IntegrityLevel mode, wchar_t* user, wchar_t* passwd) {
+    AppContainer problem:
+      Process is created but CoGetClassObject activation gives E_ACCESSDENIED (The machine-default permission settings do not grant Local Activation permission for the COM Server) */
+CComPtr<IUnknown> CoCreateAsUser_impersonate (CLSID clsid, IntegrityLevel mode, bool grant_appcontainer_permissions) {
     std::unique_ptr<ImpersonateThread> impersonate;
-    bool implicit_process_create = true;
-    if (implicit_process_create && (mode != IntegrityLevel::AppContainer)) {
-        // impersonate a different user
-        impersonate.reset(new ImpersonateThread(user, passwd, mode));
-    } else {
-        // launch process in an AppContainer process.
-        std::wstring exe_path = GetLocalServerPath(clsid);
-        HandleWrap proc = ProcCreate(exe_path.c_str(), mode, true, 0, nullptr);
+    bool explicit_process_create = (mode == IntegrityLevel::AppContainer);
+    if (explicit_process_create) {
+        // launch COM server process manually
+        std::wstring exe_path;
+        std::wstring app_id;
+        std::tie(exe_path, app_id) = GetLocalServerPath(clsid);
+
+        if (grant_appcontainer_permissions) {
+            // grant ALL_APPLICATION_PACKAGES permission to the COM EXE & DCOM LaunchPermission
+            const wchar_t ac_str_sid[] = L"S-1-15-2-1"; // ALL_APP_PACKAGES
+
+            DWORD err = Permissions::MakePathAppContainer(ac_str_sid, exe_path.c_str(), GENERIC_READ | GENERIC_EXECUTE);
+            if (err != ERROR_SUCCESS) {
+                _com_error error(err);
+                std::wcerr << L"ERROR: Failed to grant AppContainer permissions to the EXE, MSG=\"" << error.ErrorMessage() << L"\" (" << err << L")" << std::endl;
+                exit(-2);
+            }
+            err = Permissions::EnableLaunchActPermission(ac_str_sid, app_id.c_str());
+            if (err != ERROR_SUCCESS) {
+                _com_error error(err);
+                std::wcerr << L"ERROR: Failed to grant AppContainer AppID LaunchPermission, MSG=\"" << error.ErrorMessage() << L"\" (" << err << L")" << std::endl;
+                exit(-2);
+            }
+        }
+
+        HandleWrap proc = ProcCreate(exe_path.c_str(), mode, {L"-Embedding"}); // mimic how svchost passes "-Embedding" argument
         // impersonate the process thread
         impersonate.reset(new ImpersonateThread(proc));
+    } else {
+        // impersonate a different integrity (or user)
+        impersonate.reset(new ImpersonateThread(mode));
     }
 
     CComPtr<IUnknown> obj;
@@ -58,65 +107,23 @@ CComPtr<IUnknown> CoCreateAsUser_impersonate (CLSID clsid, IntegrityLevel mode, 
     // open Event Viewer, "Windows Logs" -> "System" log to see details on failures
     CComPtr<IClassFactory> cf;
     HRESULT hr = CoGetClassObject(clsid, CLSCTX_LOCAL_SERVER | CLSCTX_ENABLE_CLOAKING, NULL, IID_IClassFactory, (void**)&cf);
-    CHECK(hr);
+    if ((mode == IntegrityLevel::AppContainer) && (hr == E_ACCESSDENIED)) {
+        std::wcerr << L"ERROR: CoGetClassObject access denied when trying to create a new COM server instance. Have you remember to grant AppContainer permissions?" << std::endl;
+        exit(-3);
+    } else {
+        CHECK(hr);
+    }
     hr = cf->CreateInstance(nullptr, IID_IUnknown, (void**)&obj);
     CHECK(hr);
 #else
     HRESULT hr = obj.CoCreateInstance(clsid, nullptr, CLSCTX_LOCAL_SERVER | CLSCTX_ENABLE_CLOAKING);
-    CHECK(hr);
-#endif
-
-    return obj;
-}
-
-
-/** Attempt to create a COM server that runds through a specific user account.
-    WARNING: Does not seem to work. Fails silently and instead launches with the current user.
-    REF: https://stackoverflow.com/questions/10589440/cocreateinstanceex-returns-s-ok-with-invalid-credentials-on-win2003/54135347#54135347 */
-CComPtr<IUnknown> CoCreateAsUser_dcom(CLSID clsid, wchar_t* user, wchar_t* passwd) {
-    CComPtr<IUnknown> obj;
-    {
-#pragma warning(push)
-#pragma warning(disable: 4996) // _wgetenv: This function or variable may be unsafe. Consider using _wdupenv_s instead.
-        std::wstring computername = _wgetenv(L"COMPUTERNAME");
-#pragma warning(pop)
-        std::wstring domain = L"";
-
-        COAUTHIDENTITY id = {};
-        id.User = (USHORT*)user;
-        id.UserLength = (ULONG)wcslen(user);
-        id.Domain = (USHORT*)domain.c_str();
-        id.DomainLength = (ULONG)domain.length();
-        id.Password = (USHORT*)passwd;
-        id.PasswordLength = (ULONG)wcslen(passwd);
-        id.Flags = SEC_WINNT_AUTH_IDENTITY_UNICODE;
-
-        COAUTHINFO ai = {};
-        ai.dwAuthnSvc = RPC_C_AUTHN_WINNT; // RPC_C_AUTHN_DEFAULT;
-        ai.dwAuthzSvc = RPC_C_AUTHZ_NONE;
-        ai.pwszServerPrincName = nullptr; // (WCHAR*)computername.c_str();
-        ai.dwAuthnLevel = RPC_C_AUTHN_LEVEL_DEFAULT; //RPC_C_AUTHN_LEVEL_CALL;
-        ai.dwImpersonationLevel = RPC_C_IMP_LEVEL_IMPERSONATE;
-        ai.pAuthIdentityData = &id;
-        ai.dwCapabilities = EOAC_NONE; // EOAC_STATIC_CLOAKING;
-
-        COSERVERINFO si = {};
-        si.pAuthInfo = &ai;
-        si.pwszName = (WCHAR*)computername.c_str();
-
-#ifdef DEBUG_COM_ACTIVATION
-        CComPtr<IClassFactory> cf;
-        HRESULT hr = CoGetClassObject(clsid, CLSCTX_REMOTE_SERVER, &si, IID_IClassFactory, (void**)&cf);
+    if ((mode == IntegrityLevel::AppContainer) && (hr == E_ACCESSDENIED)) {
+        std::wcerr << L"ERROR: CoCreateInstance access denied when trying to create a new COM server instance. Have you remember to grant AppContainer permissions?" << std::endl;
+        exit(-3);
+    } else {
         CHECK(hr);
-        hr = cf->CreateInstance(nullptr, IID_IUnknown, (void**)&obj);
-        CHECK(hr);
-#else
-        MULTI_QI mqi = { &IID_IUnknown, nullptr, E_FAIL };
-        HRESULT hr = CoCreateInstanceEx(clsid, nullptr, CLSCTX_REMOTE_SERVER /*| CLSCTX_ENABLE_CLOAKING | CLSCTX_ENABLE_AAA*/, &si, 1, &mqi);
-        CHECK(hr);
-        obj.Attach(mqi.pItf);
-#endif
     }
+#endif
 
     return obj;
 }
