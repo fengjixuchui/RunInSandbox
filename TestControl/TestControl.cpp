@@ -54,3 +54,27 @@ HRESULT STDMETHODCALLTYPE TestControl::CreateInstance (BOOL elevated, /*in*/CLSI
         return S_OK;
     }
 }
+
+HRESULT STDMETHODCALLTYPE TestControl::TestCallback(IUnknown * obj) {
+    if (!obj)
+        return E_INVALIDARG;
+
+    // cast callback pointer
+    CComPtr<ICallbackTest> tmp;
+    HRESULT hr = obj->QueryInterface(&tmp);
+    if (FAILED(hr))
+        return E_INVALIDARG;
+
+    // invoke callback
+    return tmp->Ping();
+}
+
+HRESULT STDMETHODCALLTYPE TestControl::MoveMouseCursor(int x_pos, int y_pos) {
+    // will fail without WINSTA_WRITEATTRIBUTES access
+    BOOL ok = SetCursorPos(x_pos, y_pos);
+    if (!ok) {
+        DWORD err = GetLastError();
+        return HRESULT_FROM_WIN32(err);
+    }
+    return S_OK;
+}

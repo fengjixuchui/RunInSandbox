@@ -36,6 +36,9 @@ public:
         return &si;
     }
 
+    StartupInfoWrap(const StartupInfoWrap&) = delete;
+    StartupInfoWrap& operator=(const StartupInfoWrap&) = delete;
+
 private:
     STARTUPINFOEX si = {};
 };
@@ -62,10 +65,12 @@ public:
     PROCESS_INFORMATION* operator& () {
         return &pi;
     }
-
     PROCESS_INFORMATION* operator->() {
         return &pi;
     }
+
+    ProcessInfoWrap(const ProcessInfoWrap&) = delete;
+    ProcessInfoWrap& operator=(const ProcessInfoWrap&) = delete;
 
 private:
     PROCESS_INFORMATION pi = {};
@@ -85,19 +90,18 @@ static HandleWrap ProcCreate(const wchar_t * exe_path, IntegrityLevel mode, cons
     std::wstring cmdline = L"\"" + std::wstring(exe_path) + L"\"";
     // append arguments
     for (const auto & arg : arguments) {
-        cmdline += L" ";
-        cmdline += arg;
+        cmdline += L" " + arg;
     }
 
     ProcessInfoWrap pi;
     StartupInfoWrap si;
 
     constexpr BOOL INHERIT_HANDLES = FALSE;
-    DWORD creation_flags = EXTENDED_STARTUPINFO_PRESENT;
+    DWORD creation_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED;
     if (IsCMD(exe_path))
         creation_flags |= CREATE_NEW_CONSOLE; // required for starting cmd.exe
 
-    if ((mode == IntegrityLevel::High) && !IsUserAnAdmin()) {
+    if ((mode == IntegrityLevel::High) && !ImpersonateThread::IsProcessElevated()) {
         // request UAC elevation
         SHELLEXECUTEINFOW info = {};
         info.cbSize = sizeof(info);
@@ -138,6 +142,9 @@ static HandleWrap ProcCreate(const wchar_t * exe_path, IntegrityLevel mode, cons
         std::wcout << L"Impersonation succeeded.\n";
         WIN32_CHECK(CreateProcessAsUser(low_int.m_token, exe_path, const_cast<wchar_t*>(cmdline.data()), /*proc.attr*/nullptr, /*thread attr*/nullptr, INHERIT_HANDLES, creation_flags, /*env*/nullptr, /*cur-dir*/nullptr, (STARTUPINFO*)&si, &pi));
     }
+
+    // start main thread in process
+    ResumeThread(pi->hThread); // place breakpoint here & attach to debug process startup problems
 
     // wait for process to initialize
     // CoCreateInstance will fail with REGDB_E_CLASSNOTREG until the AppContainer process has called CoRegisterClassObject

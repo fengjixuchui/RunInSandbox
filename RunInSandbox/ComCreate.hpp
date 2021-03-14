@@ -5,63 +5,6 @@
 #include "../TestControl/ComSupport.hpp"
 //#define DEBUG_COM_ACTIVATION
 
-/** Returns the COM EXE path and AppID GIUD string. */
-static std::tuple<std::wstring,std::wstring> GetLocalServerPath (CLSID clsid, REGSAM bitness = 0/*same bitness as client*/) {
-    // build registry path
-    CComBSTR clsid_path(L"CLSID\\");
-    clsid_path.Append(clsid);
-
-    std::wstring exe_path;
-    {
-        CComBSTR local_server_path = clsid_path;
-        local_server_path.Append(L"\\LocalServer32");
-
-        // extract COM class
-        CRegKey cls_reg;
-        if (cls_reg.Open(HKEY_CLASSES_ROOT, local_server_path, KEY_READ | bitness) != ERROR_SUCCESS)
-            return {L"", L""};
-
-        ULONG exe_path_len = 0;
-        if (cls_reg.QueryStringValue(nullptr, nullptr, &exe_path_len) != ERROR_SUCCESS)
-            return {L"", L""};
-
-        exe_path.resize(exe_path_len, L'\0');
-        if (cls_reg.QueryStringValue(nullptr, const_cast<wchar_t*>(exe_path.data()), &exe_path_len) != ERROR_SUCCESS)
-            return {L"", L""};
-        exe_path.resize(exe_path_len - 1); // remove extra zero-termination
-
-        if (exe_path[0] == '"')
-            exe_path = exe_path.substr(1, exe_path.size() - 2); // remove quotes
-
-        // remove "/automation" (or other) argument if present
-        size_t idx = exe_path.find(L" /");
-        if (idx != exe_path.npos)
-            exe_path = exe_path.substr(0, idx);
-    }
-
-    std::wstring app_id;
-    if (!exe_path.empty()){
-        // extract COM class
-        CRegKey cls_reg;
-        if (cls_reg.Open(HKEY_CLASSES_ROOT, clsid_path, KEY_READ | bitness) != ERROR_SUCCESS)
-            abort();
-
-        ULONG app_id_len = 0;
-        if (cls_reg.QueryStringValue(L"AppID", nullptr, &app_id_len) != ERROR_SUCCESS)
-            abort();
-
-        app_id.resize(app_id_len, L'\0');
-        if (cls_reg.QueryStringValue(L"AppID", const_cast<wchar_t*>(app_id.data()), &app_id_len) != ERROR_SUCCESS)
-            abort();
-        app_id.resize(app_id_len - 1); // remove extra zero-termination
-    }
-
-    if (exe_path.empty() && (bitness == 0))
-        std::tie(exe_path, app_id) = GetLocalServerPath(clsid, KEY_WOW64_32KEY); // fallback to 32bit part of registry
-
-    return std::tie(exe_path,app_id);
-}
-
 
 /** Attempt to create a COM server that runds through a specific user account.
     AppContainer problem:
@@ -71,25 +14,73 @@ CComPtr<IUnknown> CoCreateAsUser_impersonate (CLSID clsid, IntegrityLevel mode, 
     bool explicit_process_create = (mode == IntegrityLevel::AppContainer);
     if (explicit_process_create) {
         // launch COM server process manually
-        std::wstring exe_path;
-        std::wstring app_id;
-        std::tie(exe_path, app_id) = GetLocalServerPath(clsid);
+        wchar_t clsid_str[39] = {};
+        int ok = StringFromGUID2(clsid, const_cast<wchar_t*>(clsid_str), static_cast<int>(std::size(clsid_str)));
+        if (!ok)
+            abort(); // should never happen
+
+        std::wstring exe_path = RegQuery::GetExePath(clsid_str);
+        if (exe_path.empty())
+            exe_path = RegQuery::GetExePath(clsid_str, KEY_WOW64_32KEY); // fallback to 32bit part of registry
+        if (exe_path.empty()) {
+            std::wcerr << L"ERROR: Unable to locate COM server EXE path." << std::endl;
+            exit(-2);
+        }
 
         if (grant_appcontainer_permissions) {
             // grant ALL_APPLICATION_PACKAGES permission to the COM EXE & DCOM LaunchPermission
             const wchar_t ac_str_sid[] = L"S-1-15-2-1"; // ALL_APP_PACKAGES
+            Permissions::Check access_checker(ac_str_sid);
 
-            DWORD err = Permissions::MakePathAppContainer(ac_str_sid, exe_path.c_str(), GENERIC_READ | GENERIC_EXECUTE);
-            if (err != ERROR_SUCCESS) {
-                _com_error error(err);
-                std::wcerr << L"ERROR: Failed to grant AppContainer permissions to the EXE, MSG=\"" << error.ErrorMessage() << L"\" (" << err << L")" << std::endl;
+            DWORD existing_access = access_checker.TryAccessPath(exe_path.c_str());
+            if (Permissions::Check::HasReadAccess(existing_access)) {
+                std::wcout << "AppContainer already have EXE access.\n";
+            } else {
+                DWORD err = Permissions::MakePathAppContainer(ac_str_sid, exe_path.c_str(), GENERIC_READ | GENERIC_EXECUTE);
+                if (err != ERROR_SUCCESS) {
+                    _com_error error(err);
+                    std::wcerr << L"ERROR: Failed to grant AppContainer permissions to the EXE, MSG=\"" << error.ErrorMessage() << L"\" (" << err << L")" << std::endl;
+                    exit(-2);
+                }
+            }
+
+            std::wstring app_id = RegQuery::GetAppID(clsid_str);
+            if (app_id.empty()) {
+                std::wcerr << L"ERROR: Unable to locate COM server AppID." << std::endl;
                 exit(-2);
             }
-            err = Permissions::EnableLaunchActPermission(ac_str_sid, app_id.c_str());
-            if (err != ERROR_SUCCESS) {
-                _com_error error(err);
-                std::wcerr << L"ERROR: Failed to grant AppContainer AppID LaunchPermission, MSG=\"" << error.ErrorMessage() << L"\" (" << err << L")" << std::endl;
-                exit(-2);
+
+            bool has_launch_perm = false;
+            {
+                // open registry path
+                CComBSTR reg_path(L"AppID\\");
+                reg_path.Append(app_id.c_str());
+
+                CRegKey appid_reg;
+                if (appid_reg.Open(HKEY_CLASSES_ROOT, reg_path, KEY_READ) != ERROR_SUCCESS) {
+                    std::wcerr << L"ERROR: Unable to open server AppID." << std::endl;
+                    exit(-2);
+                }
+                
+                ULONG launch_perm_len = 0;
+                appid_reg.QueryBinaryValue(L"LaunchPermission", nullptr, &launch_perm_len); // ignore failure
+                if (launch_perm_len > 0) {
+                    std::vector<BYTE> launch_perm_sd(launch_perm_len, 0);
+
+                    if (appid_reg.QueryBinaryValue(L"LaunchPermission", launch_perm_sd.data(), &launch_perm_len) == ERROR_SUCCESS) {
+                        ACCESS_MASK access = access_checker.TryAccess(launch_perm_sd.data());
+                        has_launch_perm = Permissions::Check::HasLaunchPermission(access);
+                    }
+                }
+            }
+
+            if (!has_launch_perm) {
+                DWORD err = Permissions::EnableLaunchActPermission(ac_str_sid, app_id.c_str());
+                if (err != ERROR_SUCCESS) {
+                    _com_error error(err);
+                    std::wcerr << L"ERROR: Failed to grant AppContainer AppID LaunchPermission, MSG=\"" << error.ErrorMessage() << L"\" (" << err << L")" << std::endl;
+                    exit(-2);
+                }
             }
         }
 
@@ -97,8 +88,13 @@ CComPtr<IUnknown> CoCreateAsUser_impersonate (CLSID clsid, IntegrityLevel mode, 
         // impersonate the process thread
         impersonate.reset(new ImpersonateThread(proc));
     } else {
-        // impersonate a different integrity (or user)
-        impersonate.reset(new ImpersonateThread(mode));
+        if ((mode <= IntegrityLevel::Medium) && ImpersonateThread::IsProcessElevated()) {
+            // escape elevation & impersonate integrity
+            impersonate.reset(new ImpersonateThread(mode, ImpersonateThread::GetShellProc()));
+        } else {
+            // impersonate desired integrity
+            impersonate.reset(new ImpersonateThread(mode));
+        }
     }
 
     CComPtr<IUnknown> obj;
@@ -132,27 +128,27 @@ CComPtr<IUnknown> CoCreateAsUser_impersonate (CLSID clsid, IntegrityLevel mode, 
 /** Create a AppID and elevation-enabled COM server in a admin process.
     REF: https://docs.microsoft.com/en-us/windows/win32/com/the-com-elevation-moniker */
 template <typename T>
-static HRESULT CoCreateInstanceElevated (HWND window, const IID & classId, T ** result) {
+static HRESULT CoCreateInstanceElevated (HWND window, const GUID clsid, T ** result) {
     if (!result)
         return E_INVALIDARG;
     if (*result)
         return E_INVALIDARG;
 
-    std::wstring name;
-    name.resize(39);
-    HRESULT hr = ::StringFromGUID2(classId, const_cast<wchar_t*>(name.data()), static_cast<int>(name.size()));
-    if (FAILED(hr))
-        return hr;
-    name = L"Elevation:Administrator!new:" + name;
+    wchar_t clsid_str[39] = {};
+    int ok = StringFromGUID2(clsid, const_cast<wchar_t*>(clsid_str), static_cast<int>(std::size(clsid_str)));
+    if (!ok)
+        abort(); // should never happen
 
-    std::wcout << L"CoGetObject: " << name << L'\n';
+    std::wstring obj_name = L"Elevation:Administrator!new:";
+    obj_name += clsid_str;
 
     BIND_OPTS3 options = {};
     options.cbStruct = sizeof(options);
     options.hwnd = window;
     options.dwClassContext = CLSCTX_LOCAL_SERVER;
 
-    return ::CoGetObject(name.c_str(), &options, __uuidof(T), reinterpret_cast<void**>(result));
+    //std::wcout << L"CoGetObject: " << obj_name << L'\n';
+    return ::CoGetObject(obj_name.c_str(), &options, __uuidof(T), reinterpret_cast<void**>(result));
 }
 
 

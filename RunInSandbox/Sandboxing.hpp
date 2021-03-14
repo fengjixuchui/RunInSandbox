@@ -1,5 +1,6 @@
 #pragma once
 #include <cassert>
+#include <tuple>
 #include <vector>
 #include <Windows.h>
 #include <atlbase.h>
@@ -9,6 +10,8 @@
 #include <sddl.h> // for SDDL_REVISION_1
 #include <userenv.h>
 #pragma comment(lib, "Userenv.lib")
+#include <authz.h>
+#pragma comment(lib, "authz.lib")
 #include <Winternl.h>
 
 
@@ -24,12 +27,11 @@ static void WIN32_CHECK(BOOL res) {
 }
 
 
+/** RAII wrapper of Win32 "handle" objects. */
 class HandleWrap {
 public:
     HandleWrap() {
     }
-
-    HandleWrap(const HandleWrap & other) = delete;
 
     HandleWrap(HandleWrap && other) {
         std::swap(handle, other.handle);
@@ -37,18 +39,18 @@ public:
 
     ~HandleWrap() {
         if (handle) {
-            WIN32_CHECK(CloseHandle(handle));
+            CloseHandle(handle);
             handle = nullptr;
         }
     }
 
     HandleWrap& operator = (HandleWrap && other) {
-        HandleWrap::~HandleWrap();
+        this->~HandleWrap();
         new(this) HandleWrap(std::move(other));
         return *this;
     }
     HandleWrap& operator = (HANDLE other) {
-        HandleWrap::~HandleWrap();
+        this->~HandleWrap();
         new(this) HandleWrap();
         handle = other;
         return *this;
@@ -62,49 +64,11 @@ public:
     }
 
 private:
+    HandleWrap(const HandleWrap & other) = delete;
+
     HANDLE handle = nullptr;
 };
 static_assert(sizeof(HandleWrap) == sizeof(HANDLE), "HandleWrap size mismatch");
-
-
-/** RAII wrapper of Win32 Security IDentifier (SID) handles. */
-class SidWrap {
-public:
-    SidWrap() {
-    }
-    ~SidWrap() {
-        Clear();
-    }
-
-    void Clear() {
-        if (sid) {
-            FreeSid(sid);
-            sid = nullptr;
-        }
-    }
-
-    void Create(WELL_KNOWN_SID_TYPE type) {
-        assert(!sid);
-
-        DWORD sid_size = SECURITY_MAX_SID_SIZE;
-        sid = LocalAlloc(LPTR, sid_size);
-        WIN32_CHECK(CreateWellKnownSid(type, nullptr, sid, &sid_size));
-    }
-
-    operator PSID () {
-        return sid;
-    }
-    PSID* operator & () {
-        return &sid;
-    }
-
-protected:
-    SidWrap (const SidWrap &) = delete;
-    SidWrap& operator = (const SidWrap &) = delete;
-
-    PSID sid = nullptr;
-};
-static_assert(sizeof(SidWrap) == sizeof(PSID), "SidWrap size mismatch");
 
 
 /** RAII wrapper of Win32 API objects allocated with LocalAlloc. */
@@ -135,6 +99,53 @@ private:
 };
 
 
+/** RAII wrapper of Win32 Security IDentifier (SID) handles. */
+class SidWrap {
+public:
+    SidWrap() {
+    }
+    ~SidWrap() {
+        Clear();
+    }
+
+    void Clear() {
+        if (sid) {
+            FreeSid(sid);
+            sid = nullptr;
+        }
+    }
+
+    void Create(WELL_KNOWN_SID_TYPE type) {
+        assert(!sid);
+
+        DWORD sid_size = SECURITY_MAX_SID_SIZE;
+        sid = LocalAlloc(LPTR, sid_size);
+        WIN32_CHECK(CreateWellKnownSid(type, nullptr, sid, &sid_size));
+    }
+
+    std::wstring ToString() const {
+        LocalWrap<wchar_t*> name_str;
+        BOOL ok = ConvertSidToStringSidW(sid, &name_str);
+        assert(ok); ok;
+        return static_cast<wchar_t*>(name_str);
+    }
+
+    operator PSID () {
+        return sid;
+    }
+    PSID* operator & () {
+        return &sid;
+    }
+
+protected:
+    SidWrap (const SidWrap &) = delete;
+    SidWrap& operator = (const SidWrap &) = delete;
+
+    PSID sid = nullptr;
+};
+static_assert(sizeof(SidWrap) == sizeof(PSID), "SidWrap size mismatch");
+
+
 /** RAII class for encapsulating AppContainer configuration. */
 class AppContainerWrap {
 public:
@@ -159,12 +170,9 @@ public:
             AddCapability(cap);
 
         // delete existing (if present)
-        HRESULT hr = DeleteAppContainerProfile(name);
-        hr;
+        Delete(name);
 
-        if (FAILED(CreateAppContainerProfile(name, name, desc,
-            m_capabilities.empty() ? nullptr : m_capabilities.data(), (DWORD)m_capabilities.size(), &m_sid)))
-            abort();
+        Create(name, desc);
     }
 
     ~AppContainerWrap() {
@@ -174,6 +182,25 @@ public:
                 c.Sid = nullptr;
             }
         }
+    }
+
+    void Create(const wchar_t * name, const wchar_t * desc) {
+        assert(!m_sid);
+
+        // try to create new container
+        HRESULT hr = CreateAppContainerProfile(name, name, desc, m_capabilities.empty() ? nullptr : m_capabilities.data(), (DWORD)m_capabilities.size(), &m_sid);
+        if (HRESULT_CODE(hr) == ERROR_ALREADY_EXISTS) {
+            // fallback to opening existing container
+            hr = DeriveAppContainerSidFromAppContainerName(name, &m_sid);
+        }
+        if (FAILED(hr))
+            abort();
+    }
+
+    void Delete(const wchar_t * name) {
+        assert(!m_sid);
+        HRESULT hr = DeleteAppContainerProfile(name);
+        hr; // ignore error
     }
 
     /** Returns a non-owning security capability struct. */
@@ -202,11 +229,11 @@ private:
 
 enum class IntegrityLevel {
     Default = 0,
-    AppContainer = 1,            ///< dummy value to ease impl.
+    AppContainer = 1,                ///< dummy value to ease impl.
     Untrusted = WinUntrustedLabelSid,///< same as ConvertStringSidToSid("S-1-16-0",..)
-    Low       = WinLowLabelSid,    ///< same as ConvertStringSidToSid("S-1-16-4096",..)
-    Medium    = WinMediumLabelSid, ///< same as ConvertStringSidToSid("S-1-16-8192",..)
-    High      = WinHighLabelSid,   ///< same as ConvertStringSidToSid("S-1-16-12288",..)
+    Low       = WinLowLabelSid,      ///< same as ConvertStringSidToSid("S-1-16-4096",..)
+    Medium    = WinMediumLabelSid,   ///< same as ConvertStringSidToSid("S-1-16-8192",..)
+    High      = WinHighLabelSid,     ///< same as ConvertStringSidToSid("S-1-16-12288",..)
 };
 
 static std::wstring ToString (IntegrityLevel integrity) {
@@ -238,6 +265,102 @@ static IntegrityLevel FromString (std::wstring arg) {
 
 class Permissions {
 public:
+    /** Determine the resulting acces mask for a filesystem object when being requested by identity_sid.
+        Based on https://docs.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-geteffectiverightsfromacla */
+    class Check {
+    public:
+        Check (const wchar_t * identity_sid) : m_autz_mgr(nullptr, nullptr), m_autz_client_ctx(nullptr, nullptr) {
+            Initialize();
+
+            SidWrap identity_sid_bin;
+            BOOL ok = ConvertStringSidToSid(identity_sid, &identity_sid_bin);
+            if (!ok)
+                throw std::runtime_error("ConvertStringSidToSid failure");
+
+            {
+                AUTHZ_CLIENT_CONTEXT_HANDLE tmp_ctx = nullptr;
+                ok = AuthzInitializeContextFromSid(0, identity_sid_bin, m_autz_mgr.get(), NULL, {}, NULL, &tmp_ctx);
+                if (!ok)
+                    throw std::runtime_error("AuthzInitializeContextFromSid failure");
+
+                m_autz_client_ctx = {tmp_ctx, AuthzFreeContext};
+            }
+        }
+
+        ~Check() {
+        }
+
+        ACCESS_MASK TryAccessPath(const wchar_t* path) {
+            LocalWrap<PSECURITY_DESCRIPTOR> path_sd;
+            {
+                // Obtain information about the security of a file or directory. The returned info. is filtered by the caller's access rights.
+                DWORD length = 0;
+                BOOL ok = GetFileSecurity(path, OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, NULL, NULL, &length);
+                if (ok || (ERROR_INSUFFICIENT_BUFFER != ::GetLastError()))
+                    return 0;
+
+                *&path_sd = LocalAlloc(LPTR, length);
+                ok = GetFileSecurity(path, OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, path_sd, length, &length);
+                if (!ok)
+                    return 0;
+            }
+
+            return TryAccess(path_sd);
+        }
+
+        ACCESS_MASK TryAccess(PSECURITY_DESCRIPTOR sd) {
+            ACCESS_MASK GrantedAccess = 0;
+            DWORD       Error = 0;
+            {
+                AUTHZ_ACCESS_REQUEST AccessRequest = {};
+                AccessRequest.DesiredAccess = MAXIMUM_ALLOWED;
+                AccessRequest.PrincipalSelfSid = NULL;
+                AccessRequest.ObjectTypeList = NULL;
+                AccessRequest.ObjectTypeListLength = 0;
+                AccessRequest.OptionalArguments = NULL;
+
+                AUTHZ_ACCESS_REPLY AccessReply = {};
+                AccessReply.ResultListLength = 1;
+                AccessReply.GrantedAccessMask = &GrantedAccess; // [size_is(ResultListLength)]
+                AccessReply.Error             = &Error;         // [size_is(ResultListLength)]
+
+                // perform access check
+                BOOL ok = AuthzAccessCheck(0, m_autz_client_ctx.get(), &AccessRequest, NULL, sd, NULL, 0, &AccessReply, NULL);
+                if (!ok)
+                    return 0;
+            }
+
+            return GrantedAccess;
+        }
+
+        /** Based on https://docs.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-geteffectiverightsfromacla */
+        static bool HasReadAccess (ACCESS_MASK mask) {
+            if ((mask & GENERIC_READ) == GENERIC_READ)
+                return true;
+            if ((mask & FILE_GENERIC_READ) == FILE_GENERIC_READ)
+                return true;
+            return false;
+        }
+
+        /** Special access control checking for COM. Must be kept in sync with EnableLaunchActPermission function below.
+            REF: https://docs.microsoft.com/en-us/windows/win32/com/access-control-lists-for-com */
+        static bool HasLaunchPermission(ACCESS_MASK mask) {
+            return (mask & COM_RIGHTS_EXECUTE) && (mask & COM_RIGHTS_EXECUTE_LOCAL) && (mask & COM_RIGHTS_ACTIVATE_LOCAL);
+        }
+
+    private:
+        void Initialize() {
+            AUTHZ_RESOURCE_MANAGER_HANDLE mgr_tmp = nullptr;
+            BOOL ok = AuthzInitializeResourceManager(AUTHZ_RM_FLAG_NO_AUDIT, NULL, NULL, NULL, NULL, &mgr_tmp);
+            if (!ok)
+                abort(); // should never happen
+            m_autz_mgr = { mgr_tmp, AuthzFreeResourceManager };
+        }
+
+        std::unique_ptr<std::remove_pointer<AUTHZ_RESOURCE_MANAGER_HANDLE>::type, decltype(&AuthzFreeResourceManager)> m_autz_mgr;
+        std::unique_ptr<std::remove_pointer<AUTHZ_CLIENT_CONTEXT_HANDLE>::type, decltype(&AuthzFreeContext)>           m_autz_client_ctx;
+    };
+
     /** Tag a folder path as writable by low-integrity processes.
         By default, only %USER PROFILE%\AppData\LocalLow is writable.
         Based on "Designing Applications to Run at a Low Integrity Level" https://docs.microsoft.com/en-us/previous-versions/dotnet/articles/bb625960(v%3dmsdn.10)
@@ -247,6 +370,9 @@ public:
     * Will fail if only the "Administrators" group have full access to the path, even if the current user is a member of that group.
     * Requires either the current user or the "Users" group to be granted full access to the path. */
     static DWORD MakePathLowIntegrity(const wchar_t * path) {
+        if (!path || (wcslen(path) == 0))
+            return ERROR_BAD_ARGUMENTS;
+
         ACL * sacl = nullptr; // system access control list (weak ptr.)
         LocalWrap<PSECURITY_DESCRIPTOR> SD; // must outlive SetNamedSecurityInfo to avoid sporadic failures
         {
@@ -267,7 +393,12 @@ public:
 
     /** Make file/folder accessible from a given AppContainer.
         Based on https://github.com/zodiacon/RunAppContainer/blob/master/RunAppContainer/RunAppContainerDlg.cpp */
-    static DWORD MakePathAppContainer(const wchar_t * ac_str_sid, const wchar_t * path, ACCESS_MASK accessMask = FILE_ALL_ACCESS) {
+    static DWORD MakePathAppContainer(const wchar_t * ac_str_sid, const wchar_t * path, ACCESS_MASK accessMask) {
+        if (!ac_str_sid || (wcslen(ac_str_sid) == 0))
+            return ERROR_BAD_ARGUMENTS;
+        if (!path || (wcslen(path) == 0))
+            return ERROR_BAD_ARGUMENTS;
+
         // convert string SID to binary
         SidWrap ac_sid;
         WIN32_CHECK(ConvertStringSidToSid(ac_str_sid, &ac_sid));
@@ -300,8 +431,14 @@ public:
 
 
     /** Enable DCOM launch & activation requests for a given AppContainer SID.
-        TODO: Append ACL instead of replacing it. */
+        TODO: Update ACLs instead of replacing it.
+        REF: https://docs.microsoft.com/en-us/windows/win32/secauthz/modifying-the-acls-of-an-object-in-c-- */
     static LSTATUS EnableLaunchActPermission (const wchar_t* ac_str_sid, const wchar_t* app_id) {
+        if (!ac_str_sid || (wcslen(ac_str_sid) == 0))
+            return ERROR_BAD_ARGUMENTS;
+        if (!app_id || (wcslen(app_id) == 0))
+            return ERROR_BAD_ARGUMENTS;
+
         // Allow World Local Launch/Activation permissions. Label the SD for LOW IL Execute UP
         // REF: https://docs.microsoft.com/en-us/windows/win32/secauthz/security-descriptor-string-format
         // REF: https://docs.microsoft.com/en-us/windows/win32/com/access-control-lists-for-com
@@ -330,17 +467,35 @@ public:
         LSTATUS lResult = appid_reg.SetBinaryValue(L"LaunchPermission", (BYTE*)*&ac_sd, dwLen);
         return lResult;
     }
+
+    /** Retrieve the account type, username & domain for a given SID. */
+    static std::tuple<SID_NAME_USE,std::wstring, std::wstring> LookupSID(SID* sid) {
+        std::wstring name(128, L'\0');
+        auto name_len = (DWORD)name.size();
+        std::wstring domain(128, L'\0');
+        auto domain_len = (DWORD)name.size();
+        SID_NAME_USE snu = {};
+        BOOL ok = LookupAccountSidW(NULL, sid, const_cast<wchar_t*>(name.data()), &name_len, const_cast<wchar_t*>(domain.data()), &domain_len, &snu);
+        if (!ok) {
+            DWORD err = GetLastError();
+            HRESULT hr = HRESULT_FROM_WIN32(err); hr;
+            return {};
+        }
+        name.resize(name_len);
+        domain.resize(domain_len);
+        return {snu, name, domain};
+    }
 };
 
 
 /** RAII class for temporarily impersonating users & integrity levels for the current thread.
     Intended to be used together with CLSCTX_ENABLE_CLOAKING when creating COM objects. */
 struct ImpersonateThread {
-    ImpersonateThread(IntegrityLevel integrity) {
+    ImpersonateThread(IntegrityLevel integrity, HANDLE proc = GetCurrentProcess()) {
         {
             // current user
             HandleWrap cur_token;
-            WIN32_CHECK(OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_ADJUST_DEFAULT | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY, &cur_token));
+            WIN32_CHECK(OpenProcessToken(proc, TOKEN_DUPLICATE | TOKEN_ADJUST_DEFAULT | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY, &cur_token));
             WIN32_CHECK(DuplicateTokenEx(cur_token, 0, NULL, SecurityImpersonation, TokenPrimary, &m_token));
         }
 
@@ -377,17 +532,31 @@ struct ImpersonateThread {
         WIN32_CHECK(SetTokenInformation(m_token, TokenIntegrityLevel, &TIL, sizeof(TOKEN_MANDATORY_LABEL) + GetLengthSid(impersonation_sid)));
     }
 
+    static HandleWrap GetShellProc() {
+        assert(ImpersonateThread::IsProcessElevated());
+
+        // use explorer.exe as parent process to escape UAC elevation
+        // REF: https://devblogs.microsoft.com/oldnewthing/20190425-00/?p=102443
+        DWORD pid = 0;
+        WIN32_CHECK(GetWindowThreadProcessId(GetShellWindow(), &pid));
+
+        HandleWrap shell_proc;
+        shell_proc = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+        assert(shell_proc);
+        return shell_proc;
+    }
+
     /** Determine the integrity level for a process.
     Based on https://github.com/chromium/chromium/blob/master/base/process/process_info_win.cc */
     static IntegrityLevel GetProcessLevel(HANDLE process_token = GetCurrentProcessToken()) {
         DWORD token_info_length = 0;
         if (GetTokenInformation(process_token, TokenIntegrityLevel, NULL, 0, &token_info_length))
-            abort();
+            abort(); // should never fail
 
         std::vector<char> token_info_buf(token_info_length);
         auto* token_info = reinterpret_cast<TOKEN_MANDATORY_LABEL*>(token_info_buf.data());
         if (!GetTokenInformation(process_token, TokenIntegrityLevel, token_info, token_info_length, &token_info_length))
-            abort();
+            abort(); // should never fail
 
         DWORD integrity_level = *GetSidSubAuthority(token_info->Label.Sid, *GetSidSubAuthorityCount(token_info->Label.Sid) - 1);
 
@@ -406,18 +575,18 @@ struct ImpersonateThread {
     static bool IsProcessElevated (HANDLE process = GetCurrentProcess()) {
         HandleWrap token;
         if (!OpenProcessToken(process, TOKEN_QUERY, &token))
-            abort();
+            abort(); // should never happen
 
         TOKEN_ELEVATION elevation = {};
         DWORD ret_len = 0;
         if (!GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &ret_len))
-            abort();
+            abort(); // should never happen
 
         {
             TOKEN_ELEVATION_TYPE elevation_type = {};
             ret_len = 0;
             if (!GetTokenInformation(token, TokenElevationType, &elevation_type, sizeof(elevation_type), &ret_len))
-                abort();
+                abort(); // should never happen
 
             if (elevation.TokenIsElevated)
                 assert(elevation_type == TokenElevationTypeFull);
@@ -427,4 +596,59 @@ struct ImpersonateThread {
     }
 
     HandleWrap  m_token;
+};
+
+
+class RegQuery {
+public:
+    /** Get EXE path for a COM class. Input is on "{hex-guid}" format. Returns empty string if the COM class is DLL-based and on failure. */
+    static std::wstring GetExePath (const std::wstring & clsid, REGSAM bitness = 0/*same bitness as client*/) {
+        // extract COM class
+        std::wstring reg_path = L"CLSID\\" + clsid + L"\\LocalServer32";
+
+        CRegKey cls_reg;
+        if (cls_reg.Open(HKEY_CLASSES_ROOT, reg_path.c_str(), KEY_READ | bitness) != ERROR_SUCCESS)
+            return L""; // unknown CLSID
+
+        ULONG exe_path_len = 0;
+        if (cls_reg.QueryStringValue(nullptr, nullptr, &exe_path_len) != ERROR_SUCCESS)
+            return L""; // unknown key
+
+        std::wstring exe_path(exe_path_len, L'\0');
+        if (cls_reg.QueryStringValue(nullptr, const_cast<wchar_t*>(exe_path.data()), &exe_path_len) != ERROR_SUCCESS)
+            abort(); // should never happen
+        exe_path.resize(exe_path_len - 1); // remove extra zero-termination
+
+        if (exe_path[0] == '"') {
+            // remove quotes and "/automation" or "-activex" arguments
+            exe_path = exe_path.substr(1); // remove begin quote
+
+            size_t idx = exe_path.find('"');
+            if (idx == exe_path.npos)
+                return L""; // malformed quoting
+            exe_path = exe_path.substr(0, idx); // remove end quote and arguments
+        }
+
+        return exe_path;
+    }
+
+    /** Get AppID GUID for a COM class. Both input & output is on "{hex-guid}" format. Returns empty string on failure. */
+    static std::wstring GetAppID (const std::wstring & clsid, REGSAM bitness = 0/*same bitness as client*/) {
+        // extract COM class
+        std::wstring reg_path = L"CLSID\\" + clsid;
+
+        CRegKey cls_reg;
+        if (cls_reg.Open(HKEY_CLASSES_ROOT, reg_path.c_str(), KEY_READ | bitness) != ERROR_SUCCESS)
+            return L""; // unknown CLSID
+
+        ULONG app_id_len = 0;
+        if (cls_reg.QueryStringValue(L"AppID", nullptr, &app_id_len) != ERROR_SUCCESS)
+            return L""; // AppID missing
+
+        std::wstring app_id(app_id_len, L'\0');
+        if (cls_reg.QueryStringValue(L"AppID", const_cast<wchar_t*>(app_id.data()), &app_id_len) != ERROR_SUCCESS)
+            abort(); // should never happen
+        app_id.resize(app_id_len - 1); // remove extra zero-termination
+        return app_id;
+    }
 };
