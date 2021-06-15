@@ -13,6 +13,7 @@
 #include <authz.h>
 #pragma comment(lib, "authz.lib")
 #include <Winternl.h>
+#pragma comment(lib, "onecoreuap.lib") // for DeriveCapabilitySidsFromName
 
 
 static void WIN32_CHECK(BOOL res) {
@@ -64,7 +65,7 @@ public:
     }
 
 private:
-    HandleWrap(const HandleWrap & other) = delete;
+    HandleWrap(const HandleWrap &) = delete;
 
     HANDLE handle = nullptr;
 };
@@ -151,23 +152,8 @@ class AppContainerWrap {
 public:
     AppContainerWrap(const wchar_t * name, const wchar_t * desc) {
         // https://docs.microsoft.com/en-us/windows/uwp/packaging/app-capability-declarations
-        // https://docs.microsoft.com/en-us/windows/win32/api/winnt/ne-winnt-well_known_sid_type
-        const WELL_KNOWN_SID_TYPE capabilities[] = {
-            WinCapabilityInternetClientSid, // confirmed to enable client sockets
-#if 0
-            WinCapabilityRemovableStorageSid, // have been unable to get this to work (see https://github.com/M2Team/Privexec/issues/31 for more info)
-            WinCapabilityInternetClientServerSid,
-            WinCapabilityPrivateNetworkClientServerSid,
-            WinCapabilityPicturesLibrarySid,
-            WinCapabilityVideosLibrarySid,
-            WinCapabilityMusicLibrarySid,
-            WinCapabilityDocumentsLibrarySid,
-            WinCapabilitySharedUserCertificatesSid,
-            WinCapabilityEnterpriseAuthenticationSid,
-#endif
-        };
-        for (auto cap : capabilities)
-            AddCapability(cap);
+        AddCapability(L"internetClient");   // confirmed to enable client sockets (but not ping)
+        AddCapability(L"removableStorage"); // have been unable to get this to work (see https://github.com/M2Team/Privexec/issues/31 for more info)
 
         // delete existing (if present)
         Delete(name);
@@ -178,7 +164,8 @@ public:
     ~AppContainerWrap() {
         for (auto &c : m_capabilities) {
             if (c.Sid) {
-                free(c.Sid);
+                HLOCAL fail = LocalFree(c.Sid);
+                assert(!fail); fail;
                 c.Sid = nullptr;
             }
         }
@@ -213,12 +200,30 @@ public:
         return sc;
     }
 
-    void AddCapability(WELL_KNOWN_SID_TYPE capability) {
-        PSID sid = malloc(SECURITY_MAX_SID_SIZE); // freed in destructor
-        DWORD sidListSize = SECURITY_MAX_SID_SIZE;
-        WIN32_CHECK(CreateWellKnownSid(capability, NULL, sid, &sidListSize));
+    void AddCapability(const wchar_t * cap_name) {
+        PSID * cap_group_sid = nullptr;
+        DWORD cap_group_sid_len = 0;
+        PSID * cap_sids = nullptr;
+        DWORD cap_sids_len = 0;
+        WIN32_CHECK(DeriveCapabilitySidsFromName(cap_name, &cap_group_sid, &cap_group_sid_len, &cap_sids, &cap_sids_len));
 
-        m_capabilities.push_back({ sid, SE_GROUP_ENABLED });
+        // forward all capability SIDs (only one in practice)
+        for (size_t i = 0; i < cap_sids_len; ++i)
+            m_capabilities.push_back({cap_sids[i], SE_GROUP_ENABLED});
+
+        // clean up cap_sids array (entries will be cleaned up in the destuctor)
+        HLOCAL fail = LocalFree(cap_sids);
+        assert(!fail);
+        cap_sids = nullptr;
+
+        // clean up cap_group_sid entries & array
+        for (size_t i = 0; i < cap_group_sid_len; ++i) {
+            fail = LocalFree(cap_group_sid[i]);
+            assert(!fail);
+        }
+        fail = LocalFree(cap_group_sid);
+        assert(!fail);
+        cap_group_sid = nullptr;
     }
 
 private:
@@ -240,9 +245,9 @@ static std::wstring ToString (IntegrityLevel integrity) {
     switch (integrity) {
     case IntegrityLevel::Default:      return L"default";
     case IntegrityLevel::AppContainer: return L"AppContainer";
-    case IntegrityLevel::Low:          return L"low integrity";
-    case IntegrityLevel::Medium:       return L"medium integrity";
-    case IntegrityLevel::High:         return L"high integrity";
+    case IntegrityLevel::Low:          return L"low IL";
+    case IntegrityLevel::Medium:       return L"medium IL";
+    case IntegrityLevel::High:         return L"high IL";
     }
 
     abort(); // never reached
@@ -361,12 +366,12 @@ public:
         std::unique_ptr<std::remove_pointer<AUTHZ_CLIENT_CONTEXT_HANDLE>::type, decltype(&AuthzFreeContext)>           m_autz_client_ctx;
     };
 
-    /** Tag a folder path as writable by low-integrity processes.
+    /** Tag a folder path as writable by low integrity level (IL) processes.
         By default, only %USER PROFILE%\AppData\LocalLow is writable.
         Based on "Designing Applications to Run at a Low Integrity Level" https://docs.microsoft.com/en-us/previous-versions/dotnet/articles/bb625960(v%3dmsdn.10)
         Equivalent to "icacls.exe  <path> /setintegritylevel Low"
 
-    Limitations when running under medium integrity (e.g. from a non-admin command prompt):
+    Limitations when running under medium IL (e.g. from a non-admin command prompt):
     * Will fail if only the "Administrators" group have full access to the path, even if the current user is a member of that group.
     * Requires either the current user or the "Users" group to be granted full access to the path. */
     static DWORD MakePathLowIntegrity(const wchar_t * path) {
@@ -376,7 +381,7 @@ public:
         ACL * sacl = nullptr; // system access control list (weak ptr.)
         LocalWrap<PSECURITY_DESCRIPTOR> SD; // must outlive SetNamedSecurityInfo to avoid sporadic failures
         {
-            // initialize "low integrity" System Access Control List (SACL)
+            // initialize "low IL" System Access Control List (SACL)
             // Security Descriptor String interpretation: (based on sddl.h)
             // SACL:(ace_type=Mandatory integrity Label (ML); ace_flags=; rights=SDDL_NO_WRITE_UP (NW); object_guid=; inherit_object_guid=; account_sid=Low mandatory level (LW))
             WIN32_CHECK(ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;;NW;;;LW)", SDDL_REVISION_1, &SD, NULL));
@@ -385,7 +390,7 @@ public:
             WIN32_CHECK(GetSecurityDescriptorSacl(SD, &sacl_present, &sacl, &sacl_defaulted));
         }
 
-        // apply "low integrity" SACL
+        // apply "low IL" SACL
         DWORD ret = SetNamedSecurityInfoW(const_cast<wchar_t*>(path), SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION, /*owner*/NULL, /*group*/NULL, /*Dacl*/NULL, sacl);
         return ret; // ERROR_SUCCESS on success
     }
@@ -491,7 +496,7 @@ public:
 /** RAII class for temporarily impersonating users & integrity levels for the current thread.
     Intended to be used together with CLSCTX_ENABLE_CLOAKING when creating COM objects. */
 struct ImpersonateThread {
-    ImpersonateThread(IntegrityLevel integrity, HANDLE proc = GetCurrentProcess()) {
+    ImpersonateThread(IntegrityLevel integrity, HANDLE proc) {
         {
             // current user
             HandleWrap cur_token;
@@ -529,19 +534,17 @@ struct ImpersonateThread {
         TOKEN_MANDATORY_LABEL TIL = {};
         TIL.Label.Attributes = SE_GROUP_INTEGRITY;
         TIL.Label.Sid = impersonation_sid;
-        WIN32_CHECK(SetTokenInformation(m_token, TokenIntegrityLevel, &TIL, sizeof(TOKEN_MANDATORY_LABEL) + GetLengthSid(impersonation_sid)));
+        WIN32_CHECK(SetTokenInformation(m_token, TokenIntegrityLevel, &TIL, sizeof(TIL) + GetLengthSid(impersonation_sid)));
     }
 
     static HandleWrap GetShellProc() {
-        assert(ImpersonateThread::IsProcessElevated());
-
         // use explorer.exe as parent process to escape UAC elevation
         // REF: https://devblogs.microsoft.com/oldnewthing/20190425-00/?p=102443
         DWORD pid = 0;
         WIN32_CHECK(GetWindowThreadProcessId(GetShellWindow(), &pid));
 
         HandleWrap shell_proc;
-        shell_proc = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+        shell_proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_CREATE_PROCESS, FALSE, pid); // QUERY_INFORMATION needed for impersonation & CREATE_PROCESS for parent-process setting
         assert(shell_proc);
         return shell_proc;
     }
@@ -582,14 +585,14 @@ struct ImpersonateThread {
         if (!GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &ret_len))
             abort(); // should never happen
 
-        {
+        if (elevation.TokenIsElevated) {
             TOKEN_ELEVATION_TYPE elevation_type = {};
             ret_len = 0;
             if (!GetTokenInformation(token, TokenElevationType, &elevation_type, sizeof(elevation_type), &ret_len))
                 abort(); // should never happen
 
-            if (elevation.TokenIsElevated)
-                assert(elevation_type == TokenElevationTypeFull);
+            // elevation_type is usually TokenElevationTypeFull, or
+            // TokenElevationTypeDefault if UAC is disabled.
         }
 
         return elevation.TokenIsElevated;
@@ -619,15 +622,26 @@ public:
             abort(); // should never happen
         exe_path.resize(exe_path_len - 1); // remove extra zero-termination
 
-        if (exe_path[0] == '"') {
+        if (exe_path[0] == L'"') {
             // remove quotes and "/automation" or "-activex" arguments
             exe_path = exe_path.substr(1); // remove begin quote
 
-            size_t idx = exe_path.find('"');
+            size_t idx = exe_path.find(L'"');
             if (idx == exe_path.npos)
                 return L""; // malformed quoting
             exe_path = exe_path.substr(0, idx); // remove end quote and arguments
         }
+
+        auto to_lower = [](std::wstring str) {
+            for (wchar_t & c : str)
+                c = towlower(c);
+            return str;
+        };
+
+        // remove "/automation" arguments after unquoted ".exe" (necessary for PowerPoint)
+        size_t idx = to_lower(exe_path).find(L".exe "); // trailing whitespace deliberate
+        if (idx != exe_path.npos)
+            exe_path = exe_path.substr(0, idx+4);
 
         return exe_path;
     }

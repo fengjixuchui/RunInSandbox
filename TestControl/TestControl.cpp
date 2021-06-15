@@ -1,6 +1,7 @@
 #include "TestControl.hpp"
 #include "../RunInSandbox/ComCreate.hpp"
 #include "Socket.hpp"
+#include <atlwin.h>
 
 
 TestControl::TestControl(){
@@ -9,22 +10,33 @@ TestControl::TestControl(){
 TestControl::~TestControl() {
 }
 
-HRESULT STDMETHODCALLTYPE TestControl::Add(int a, int b, int * sum) {
+HRESULT TestControl::Add(int a, int b, int * sum) {
     *sum = a + b;
     return S_OK;
 }
 
-HRESULT STDMETHODCALLTYPE TestControl::IsElevated (/*out*/BOOL * is_elevated, /*out*/BOOL * high_integrity) {
+
+HRESULT TestControl::PerformAdminTask() {
+    IntegrityLevel proc_integrity = ImpersonateThread::GetProcessLevel();
+    if (proc_integrity < IntegrityLevel::High)
+        return E_ACCESSDENIED;
+
+    // TODO: Perform some task requiring admin privileves
+    return S_OK;
+}
+
+
+HRESULT TestControl::IsElevated (/*out*/BOOL * is_elevated, /*out*/BOOL * is_high_il) {
     *is_elevated = ImpersonateThread::IsProcessElevated();
 
     IntegrityLevel proc_integrity = ImpersonateThread::GetProcessLevel();
-    *high_integrity = (proc_integrity >= IntegrityLevel::High);
+    *is_high_il = (proc_integrity >= IntegrityLevel::High);
 
     return S_OK;
 }
 
 
-HRESULT STDMETHODCALLTYPE TestControl::TestNetworkConnection (/*in*/BSTR host, USHORT port, /*out*/BOOL * can_access) {
+HRESULT TestControl::TestNetworkConnection (/*in*/BSTR host, USHORT port, /*out*/BOOL * can_access) {
     *can_access = false; // assume no connectivity by default
 
     try {
@@ -38,7 +50,7 @@ HRESULT STDMETHODCALLTYPE TestControl::TestNetworkConnection (/*in*/BSTR host, U
 }
 
 
-HRESULT STDMETHODCALLTYPE TestControl::CreateInstance (BOOL elevated, /*in*/CLSID clsid, /*out*/IUnknown ** obj) {
+HRESULT TestControl::CreateInstance (BOOL elevated, /*in*/CLSID clsid, /*out*/IUnknown ** obj) {
     if (!obj)
         return E_INVALIDARG;
 
@@ -55,7 +67,7 @@ HRESULT STDMETHODCALLTYPE TestControl::CreateInstance (BOOL elevated, /*in*/CLSI
     }
 }
 
-HRESULT STDMETHODCALLTYPE TestControl::TestCallback(IUnknown * obj) {
+HRESULT TestControl::TestCallback(IUnknown * obj) {
     if (!obj)
         return E_INVALIDARG;
 
@@ -69,12 +81,56 @@ HRESULT STDMETHODCALLTYPE TestControl::TestCallback(IUnknown * obj) {
     return tmp->Ping();
 }
 
-HRESULT STDMETHODCALLTYPE TestControl::MoveMouseCursor(int x_pos, int y_pos) {
-    // will fail without WINSTA_WRITEATTRIBUTES access
+
+HRESULT TestControl::MoveMouseCursor(int x_pos, int y_pos) {
+    // create independent window to receive cursor events
+    CWindow wnd;
+    {
+        RECT rect = { 0, 0, 200, 200 };
+        wnd.Create(L"Button", /*parent*/NULL, rect, L"MoveMouseCursor", WS_OVERLAPPEDWINDOW);
+        wnd.ShowWindow(SW_SHOW);
+    }
+
+    // move window to foreground, so that it starts receiving events
+    {
+        // bring window to the front & activate it
+        BOOL ok = BringWindowToTop(wnd);
+        assert(ok);
+        // verify that window is activated
+        HWND active_wnd = GetActiveWindow();
+        assert(wnd == active_wnd);
+
+        ok = SetForegroundWindow(wnd); // assume host have called CoAllowSetForegroundWindow first
+        assert(ok);
+
+        HWND foreground_wnd = GetForegroundWindow();
+        if (foreground_wnd != wnd) {
+            // SetForegroundWindow failed silently due to UIPI limitation
+            DWORD err = GetLastError(); // TODO: Figure out why err==0 here
+            return E_ACCESSDENIED;
+        }
+    }
+
+    // will fail if the foreground window is running at higher IL than this process (UIPI limitation)
     BOOL ok = SetCursorPos(x_pos, y_pos);
     if (!ok) {
-        DWORD err = GetLastError();
-        return HRESULT_FROM_WIN32(err);
+        DWORD err = GetLastError(); // TODO: Figure out why err==0 here
+        return E_ACCESSDENIED;
     }
+
+    return S_OK;
+}
+
+
+HRESULT TestControl::GetWindow(/*out*/HWND* result) {
+    // create dummy window that will be used for establishing a parent-child UI relationship with the parent process
+    CWindow wnd;
+    {
+        RECT rect = { 200, 0, 400, 200 };
+        wnd.Create(L"Button", /*parent*/NULL, rect, L"Child window", WS_OVERLAPPEDWINDOW);
+        wnd.ShowWindow(SW_SHOW);
+    }
+
+    *result = wnd;
     return S_OK;
 }

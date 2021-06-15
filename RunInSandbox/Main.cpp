@@ -4,6 +4,7 @@
 #include <Shlobj.h>
 #include <atlbase.h>
 #include <atlcom.h>
+#include <atlwin.h>
 #include <wincred.h>
 #pragma comment(lib, "Credui.lib")
 #include "ComCreate.hpp"
@@ -11,22 +12,16 @@
 #include "../TestControl/TestControl_h.h"
 
 
+/** COM callback test class. */
 class ATL_NO_VTABLE CallbackTest : 
     public CComObjectRootEx<CComMultiThreadModel>,
     public CComCoClass<CallbackTest>, // no registry entries
     public ICallbackTest {
 public:
-    CallbackTest () {
-    }
-
-    ~CallbackTest() {
-    }
-
     HRESULT STDMETHODCALLTYPE Ping () override {
         std::wcout << L"  Callback received.\n";
         return S_OK;
     }
-
 
     BEGIN_COM_MAP(CallbackTest)
         COM_INTERFACE_ENTRY(ICallbackTest)
@@ -34,16 +29,11 @@ public:
 };
 
 
-/** Dummy class for enabling OLE drag-and-drop that's not used for anything. */
+/** Dummy class for enabling OLE drag-and-drop. Not used for anything. */
 class DropTarget : 
     public CComObjectRootEx<CComSingleThreadModel>,
     public CComCoClass<DropTarget>, // no registry entries
-    public IDropTarget
-{
-    BEGIN_COM_MAP(DropTarget)
-        COM_INTERFACE_ENTRY(IDropTarget)
-    END_COM_MAP()
-
+    public IDropTarget {
 public:
     HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* /*pDataObj*/, DWORD /*grfKeyState*/, POINTL /*pt*/, DWORD* /*pdwEffect*/) override {
         return E_NOTIMPL;
@@ -57,20 +47,19 @@ public:
     HRESULT STDMETHODCALLTYPE Drop(IDataObject* /*pDataObj*/, DWORD /*grfKeyState*/, POINTL /*pt*/, DWORD* /*pdwEffect*/) override {
         return E_NOTIMPL;
     }
+
+    BEGIN_COM_MAP(DropTarget)
+        COM_INTERFACE_ENTRY(IDropTarget)
+    END_COM_MAP()
 };
 
 class RunInSandboxModule: public ATL::CAtlExeModuleT<RunInSandboxModule> {
-public:
-    //DECLARE_LIBID(LIBID_RunInSandboxModule)
 };
 
 RunInSandboxModule _AtlModule;
 
 
-static void ThreadedComTests (CLSID clsid, IntegrityLevel mode, bool grant_appcontainer_permissions, HWND wnd) {
-    SetThreadDescription(GetCurrentThread(), L"COM thread (MTA)");
-    CoInitializeEx(NULL, COINIT_MULTITHREADED);
-
+static void ComTests (CLSID clsid, IntegrityLevel mode, bool grant_appcontainer_permissions, HWND wnd) {
     CComPtr<IUnknown> obj;
     if ((mode == IntegrityLevel::High) && !ImpersonateThread::IsProcessElevated()) {
         // launch "COM Elevation Moniker"-compatible COM class in elevated process
@@ -81,55 +70,84 @@ static void ThreadedComTests (CLSID clsid, IntegrityLevel mode, bool grant_appco
         obj = CoCreateAsUser_impersonate(clsid, mode, grant_appcontainer_permissions);
     }
 
+    // allow COM server to set foreground window (needed to escape UIPI limitations)
+    CHECK(CoAllowSetForegroundWindow(obj, NULL));
+
     // try to add two numbers
-    CComPtr<ISimpleCalculator> calc;
-    obj.QueryInterface(&calc);
-    if (calc) {
+    CComPtr<ITestInterface> test;
+    obj.QueryInterface(&test);
+    if (test) {
         int sum = 0;
-        CHECK(calc->Add(2, 3, &sum));
+        CHECK(test->Add(2, 3, &sum));
 
         std::wcout << L"Add(2, 3) returned " << sum << L".\n";
         assert(sum == 2 + 3);
 
-        BOOL is_elevated = false, high_integrity = false;
-        CHECK(calc->IsElevated(&is_elevated, &high_integrity));
+        BOOL is_elevated = false, is_high_il = false;
+        CHECK(test->IsElevated(&is_elevated, &is_high_il));
         std::wcout << L"IsElevated: " << (is_elevated ? L"true" : L"false") << L"\n";
-        std::wcout << L"HighIntegrity: " << (high_integrity ? L"true" : L"false") << L"\n";
+        std::wcout << L"IsHighIL: " << (is_high_il ? L"true" : L"false") << L"\n";
 
         {
             // fails for AppContainers if host is elevated
             std::wcout << L"Testing COM callback...\n";
             auto cb = CreateLocalInstance<CallbackTest>();
-            CHECK(calc->TestCallback(cb));
+            CHECK(test->TestCallback(cb));
             std::wcout << L"[success]\n";
         }
 
-        if (mode != IntegrityLevel::AppContainer) {
-            // fails silently in low integrity
-            // fails silently in medium integrity if host is elevated
-            std::wcout << L"Moving mouse cursor to top-left corner...\n";
-            CHECK(calc->MoveMouseCursor(0, 0));
+        if (mode >= IntegrityLevel::High) {
+            std::wcout << L"Verifying that admin task succeeds...\n";
+            CHECK(test->PerformAdminTask());
             std::wcout << L"[success]\n";
+        }
+
+        if (mode >= IntegrityLevel::Medium) {
+            bool reproduce_uipi_child_wnd_issue = true;
+            if (reproduce_uipi_child_wnd_issue) {
+                // Request child window from sandboxed COM/OLE process
+                CComPtr<IOleWindow> win_test;
+                test.QueryInterface(&win_test);
+                HWND child_wnd = {};
+                CHECK(win_test->GetWindow(&child_wnd));
+
+                // Attach child to (invisible) parent window to simulate OLE embedding. This triggers UIPI SetForegroundWindow blocking that also affect unrelated windows.
+                auto winStyle = GetWindowLongPtrW(child_wnd, GWL_STYLE);
+                winStyle &= ~WS_CAPTION; // Remove title bar
+                winStyle |= WS_CHILD;    // Convert to child window. Trigger UIPI blocking when used together with SetParent.
+                SetWindowLongPtrW(child_wnd, GWL_STYLE, winStyle);
+                SetParent(child_wnd, wnd); // Trigger UIPI blocking when used together with WS_CHILD
+            }
+
+            // Fails in medium IL if host is elevated despite the window being in foreground.
+            std::wcout << L"Moving mouse cursor to top-left corner...\n";
+            HRESULT hr = test->MoveMouseCursor(0, 0);
+            if (FAILED(hr)) {
+                _com_error err(hr);
+                std::wcout << L"[FAILED] " << err.ErrorMessage() << std::endl;
+            } else {
+                std::wcout << L"[success]\n";
+            }
         }
 
 #if 0
         BOOL has_network = false;
         CComBSTR host = L"1.1.1.1"; // cloudflare
-        calc->TestNetworkConnection(host, 80, &has_network);
+        test->TestNetworkConnection(host, 80, &has_network);
         std::wcout << L"HasNetwork: " << (has_network ? L"true" : L"false") << L"\n";
 #endif
 #if 0
         // try to create child object in elevated process
         // WARNING: Doesn't trigger UAC elevation if launched from a medium-integrity process that was launched from an elevated process
-        std::wcout << L"Creating child COM object " << progid << L" in " << ToString(IntegrityLevel::High).c_str() << L"...\n";
+        std::wcout << L"Creating child COM object in " << ToString(IntegrityLevel::High).c_str() << L"...\n";
         CComPtr<IUnknown> child;
-        CHECK(calc->CreateInstance(true, clsid, &child));
-        CComPtr<ISimpleCalculator> child_calc;
-        child_calc = child;
-        is_elevated = false, high_integrity = false;
-        CHECK(child_calc->IsElevated(&is_elevated, &high_integrity));
+        CHECK(test->CreateInstance(true, clsid, &child));
+        CComPtr<ITestInterface> child_test;
+        child_test = child;
+        is_elevated = false, is_high_il = false;
+        CHECK(child_test->IsElevated(&is_elevated, &is_high_il));
         std::wcout << L"Child IsElevated: " << (is_elevated ? L"true" : L"false") << L"\n";
-        std::wcout << L"Child HighIntegrity: " << (high_integrity ? L"true" : L"false") << L"\n";
+        std::wcout << L"Child IsHighIL: " << (is_high_il ? L"true" : L"false") << L"\n";
 #endif
     }
 
@@ -166,12 +184,9 @@ int wmain (int argc, wchar_t *argv[]) {
     arg_idx++;
 
     bool grant_appcontainer_permissions = false;
-    bool drag_n_drop = false;
     while (arg_idx < argc) {
         if (std::wstring(argv[arg_idx]) == L"-g") {
             grant_appcontainer_permissions = true;
-        } else if (std::wstring(argv[arg_idx]) == L"-dnd") {
-            drag_n_drop = true;
         }
         arg_idx++;
     }
@@ -181,30 +196,24 @@ int wmain (int argc, wchar_t *argv[]) {
         OleInitialize(NULL);
         HWND wnd = FindWindowEx(HWND_MESSAGE, NULL, NULL, NULL); // invisible message-only window for COM apartment
 
-        if (drag_n_drop) {
+        // adjust COM security to allow OLE drag-and-drop
+        HRESULT hr = CoInitializeSecurity(nullptr, -1/*auto*/, nullptr, NULL/*reserved*/,
+            RPC_C_AUTHN_LEVEL_DEFAULT, ///< 
+            RPC_C_IMP_LEVEL_IDENTIFY,  ///< allow server to identify but not impersonate client
+            nullptr, EOAC_NONE/*capabilities*/, NULL/*reserved*/);
+        if (FAILED(hr))
+            abort();
+
+        {
             std::wcout << L"Enabling OLE drag-and-drop.\n";
-            // Triggers 0x80070005 "Access is denied" exception in AppContainer process if this process is elevated (high integrity level)
-            // that then leads to 0x800706BE "The remote procedure call failed" in this process.
+            // Triggers 0x80070005 "Access is denied" exception in AppContainer process if this process is elevated (high integrity level) unless COM security is tweaked
             auto drop_target = CreateLocalInstance<DropTarget>();
             CHECK(RegisterDragDrop(wnd, drop_target));
         }
 
         std::wcout << L"Creating COM object " << progid << L" in " << ToString(mode).c_str() << L"...\n";
-        std::thread t(ThreadedComTests, clsid, mode, grant_appcontainer_permissions, wnd);
-
-        // pump messages until receiving WM_QUIT
-        MSG msg = {};
-        BOOL ret = false;
-        while((ret = GetMessage( &msg, NULL, 0, 0 )) != 0) { 
-            if (ret == -1) {
-                break; // break on error
-            } else {
-                TranslateMessage(&msg); 
-                DispatchMessage(&msg); 
-            }
-        }
-
-        t.join();
+        // perform COM calls from main thread (STA)
+        ComTests(clsid, mode, grant_appcontainer_permissions, wnd);
     } else if (url_provided) {
         std::wcout << L"Opening URL " << progid << " in default browser\n";
         if (ImpersonateThread::GetProcessLevel() == IntegrityLevel::Low)
@@ -221,7 +230,21 @@ int wmain (int argc, wchar_t *argv[]) {
         for (; arg_idx < argc; ++arg_idx)
             args.push_back(argv[arg_idx]);
 
-        ProcCreate(progid.c_str(), mode, args);
+        StartupInfoWrap si;
+
+        std::unique_ptr<AppContainerWrap> ac;
+        SECURITY_CAPABILITIES sec_cap = {}; // need to outlive CreateProcess
+        if (mode == IntegrityLevel::AppContainer) {
+            // create new AppContainer process, based on STARTUPINFO
+            ac.reset(new AppContainerWrap(L"RunInSandbox.AppContainer", L"RunInSandbox.AppContainer"));
+
+            sec_cap = ac->SecCap(); // need to outlive CreateProcess
+            si.SetSecurity(&sec_cap);
+
+            mode = IntegrityLevel::Default; // avoid double-impersonation
+        }
+
+        ProcCreate(si, progid.c_str(), mode, args);
     }
 
     std::wcout << L"[done]" << std::endl;

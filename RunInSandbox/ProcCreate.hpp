@@ -1,6 +1,5 @@
 #pragma once
 #include <Shlobj.h>
-#include "Sandboxing.hpp"
 
 
 /** RAII wrapper OF STARTUPINFOEX. */
@@ -86,7 +85,7 @@ static bool IsCMD (std::wstring path) {
 
 
 /** Launch a new process within an AppContainer. */
-static HandleWrap ProcCreate(const wchar_t * exe_path, IntegrityLevel mode, const std::vector<std::wstring>& arguments) {
+static HandleWrap ProcCreate(StartupInfoWrap & si, const wchar_t * exe_path, IntegrityLevel mode, const std::vector<std::wstring>& arguments) {
     std::wstring cmdline = L"\"" + std::wstring(exe_path) + L"\"";
     // append arguments
     for (const auto & arg : arguments) {
@@ -94,10 +93,9 @@ static HandleWrap ProcCreate(const wchar_t * exe_path, IntegrityLevel mode, cons
     }
 
     ProcessInfoWrap pi;
-    StartupInfoWrap si;
 
     constexpr BOOL INHERIT_HANDLES = FALSE;
-    DWORD creation_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED;
+    DWORD creation_flags = EXTENDED_STARTUPINFO_PRESENT;
     if (IsCMD(exe_path))
         creation_flags |= CREATE_NEW_CONSOLE; // required for starting cmd.exe
 
@@ -114,46 +112,51 @@ static HandleWrap ProcCreate(const wchar_t * exe_path, IntegrityLevel mode, cons
         WIN32_CHECK(::ShellExecuteExW(&info));
         std::wcout << L"Successfully created elevated process.\n";
         return {};
-    } else if (mode == IntegrityLevel::Medium) {
+    } else {
         HandleWrap parent_proc; // lifetime tied to "si"
-        if (ImpersonateThread::IsProcessElevated()) {
+        if ((mode <= IntegrityLevel::Medium) && ImpersonateThread::IsProcessElevated()) {
             // use explorer.exe as parent process to escape existing UAC elevation
             // REF: https://devblogs.microsoft.com/oldnewthing/20190425-00/?p=102443
-            DWORD pid = 0;
-            WIN32_CHECK(GetWindowThreadProcessId(GetShellWindow(), &pid));
-            parent_proc = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, pid);
-            assert(parent_proc);
+            parent_proc = ImpersonateThread::GetShellProc();
             si.SetParent(&parent_proc);
             std::wcout << L"Using explorer as parent process to escape elevation.\n";
         }
 
-        // processes are created with medium integrity as default, regardless of UAC settings
-        WIN32_CHECK(CreateProcess(exe_path, const_cast<wchar_t*>(cmdline.data()), /*proc.attr*/nullptr, /*thread attr*/nullptr, INHERIT_HANDLES, creation_flags, /*env*/nullptr, /*cur-dir*/nullptr, (STARTUPINFO*)&si, &pi));
-    } else if (mode == IntegrityLevel::AppContainer) {
-        AppContainerWrap ac(L"RunInSandbox.AppContainer", L"RunInSandbox.AppContainer");
-        SECURITY_CAPABILITIES sec_cap = ac.SecCap();
-
-        // create new AppContainer process, based on STARTUPINFO
-        si.SetSecurity(&sec_cap);
-
-        WIN32_CHECK(CreateProcess(exe_path, const_cast<wchar_t*>(cmdline.data()), /*proc.attr*/nullptr, /*thread attr*/nullptr, INHERIT_HANDLES, creation_flags, /*env*/nullptr, /*cur-dir*/nullptr, (STARTUPINFO*)&si, &pi));
-    } else {
-        ImpersonateThread low_int(mode);
-        std::wcout << L"Impersonation succeeded.\n";
-        WIN32_CHECK(CreateProcessAsUser(low_int.m_token, exe_path, const_cast<wchar_t*>(cmdline.data()), /*proc.attr*/nullptr, /*thread attr*/nullptr, INHERIT_HANDLES, creation_flags, /*env*/nullptr, /*cur-dir*/nullptr, (STARTUPINFO*)&si, &pi));
+        if (mode != IntegrityLevel::Default) {
+            // impersonate desired integrity level
+            ImpersonateThread low_int(mode, GetCurrentProcess());
+            std::wcout << L"Impersonation succeeded.\n";
+            WIN32_CHECK(CreateProcessAsUser(low_int.m_token, exe_path, const_cast<wchar_t*>(cmdline.data()), /*proc.attr*/nullptr, /*thread attr*/nullptr, INHERIT_HANDLES, creation_flags, /*env*/nullptr, /*cur-dir*/nullptr, (STARTUPINFO*)&si, &pi));
+        } else {
+            // use STARTUPINFO to determine integrity level
+            WIN32_CHECK(CreateProcess(exe_path, const_cast<wchar_t*>(cmdline.data()), /*proc.attr*/nullptr, /*thread attr*/nullptr, INHERIT_HANDLES, creation_flags, /*env*/nullptr, /*cur-dir*/nullptr, (STARTUPINFO*)&si, &pi));
+        }
     }
 
-    // start main thread in process
-    ResumeThread(pi->hThread); // place breakpoint here & attach to debug process startup problems
-
     // wait for process to initialize
-    // CoCreateInstance will fail with REGDB_E_CLASSNOTREG until the AppContainer process has called CoRegisterClassObject
-    // TODO: Either call CoCreateInstance in a loop or have some sort of synchronization mechanism
     // ignore failure if process is not a GUI app
     WaitForInputIdle(pi->hProcess, INFINITE);
 
-    // wait a bit more (WaitForInputIdle doesn't seem to be sufficient)
-    Sleep(200);
+    // return process handle
+    HandleWrap proc;
+    std::swap(*&proc, pi->hProcess);
+    return proc;
+}
+
+
+/** Create and kill an AppContainer process, just to get a process handle that can later be impersonated. */
+static HandleWrap CreateAndKillAppContainerProcess (AppContainerWrap & ac, const wchar_t * exe_path) {
+    StartupInfoWrap si;
+    SECURITY_CAPABILITIES sec_cap = ac.SecCap(); // need to outlive CreateProcess
+    si.SetSecurity(&sec_cap);
+
+    // create new AppContainer process in suspended state
+    ProcessInfoWrap pi;
+    WIN32_CHECK(CreateProcess(exe_path, nullptr, /*proc.attr*/nullptr, /*thread attr*/nullptr, /*INHERIT_HANDLES*/FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED, /*env*/nullptr, /*cur-dir*/nullptr, (STARTUPINFO*)&si, &pi));
+
+    // Kill process since we're only interested in the handle for now.
+    // The COM runtime will later recreate the process when calling CoCreateInstance.
+    WIN32_CHECK(TerminateProcess(pi->hProcess, 0));
 
     // return process handle
     HandleWrap proc;

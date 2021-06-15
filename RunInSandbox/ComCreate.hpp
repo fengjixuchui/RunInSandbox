@@ -3,7 +3,6 @@
 #include "ProcCreate.hpp"
 #include <tuple>
 #include "../TestControl/ComSupport.hpp"
-//#define DEBUG_COM_ACTIVATION
 
 
 /** Attempt to create a COM server that runds through a specific user account.
@@ -84,42 +83,42 @@ CComPtr<IUnknown> CoCreateAsUser_impersonate (CLSID clsid, IntegrityLevel mode, 
             }
         }
 
-        HandleWrap proc = ProcCreate(exe_path.c_str(), mode, {L"-Embedding"}); // mimic how svchost passes "-Embedding" argument
-        // impersonate the process thread
-        impersonate.reset(new ImpersonateThread(proc));
+        if (mode == IntegrityLevel::AppContainer) {
+            AppContainerWrap ac(L"RunInSandbox.AppContainer", L"RunInSandbox.AppContainer");
+            HandleWrap proc = CreateAndKillAppContainerProcess(ac, exe_path.c_str());
+            // impersonate the process handle
+            impersonate.reset(new ImpersonateThread(proc));
+        } else {
+            StartupInfoWrap si;
+            HandleWrap proc = ProcCreate(si, exe_path.c_str(), mode, {L"-Embedding"}); // mimic how svchost passes "-Embedding" argument
+            // impersonate the process handle
+            impersonate.reset(new ImpersonateThread(proc));
+        }
     } else {
-        if ((mode <= IntegrityLevel::Medium) && ImpersonateThread::IsProcessElevated()) {
+        if (mode == IntegrityLevel::Default) {
+            // no impersonation
+        } else if ((mode <= IntegrityLevel::Medium) && ImpersonateThread::IsProcessElevated()) {
             // escape elevation & impersonate integrity
             impersonate.reset(new ImpersonateThread(mode, ImpersonateThread::GetShellProc()));
         } else {
             // impersonate desired integrity
-            impersonate.reset(new ImpersonateThread(mode));
+            impersonate.reset(new ImpersonateThread(mode, GetCurrentProcess()));
         }
     }
 
-    CComPtr<IUnknown> obj;
     // create COM object in a separate process
-#ifdef DEBUG_COM_ACTIVATION
-    // open Event Viewer, "Windows Logs" -> "System" log to see details on failures
-    CComPtr<IClassFactory> cf;
-    HRESULT hr = CoGetClassObject(clsid, CLSCTX_LOCAL_SERVER | CLSCTX_ENABLE_CLOAKING, NULL, IID_IClassFactory, (void**)&cf);
-    if ((mode == IntegrityLevel::AppContainer) && (hr == E_ACCESSDENIED)) {
-        std::wcerr << L"ERROR: CoGetClassObject access denied when trying to create a new COM server instance. Have you remember to grant AppContainer permissions?" << std::endl;
-        exit(-3);
-    } else {
-        CHECK(hr);
-    }
-    hr = cf->CreateInstance(nullptr, IID_IUnknown, (void**)&obj);
-    CHECK(hr);
-#else
-    HRESULT hr = obj.CoCreateInstance(clsid, nullptr, CLSCTX_LOCAL_SERVER | CLSCTX_ENABLE_CLOAKING);
+    DWORD cls_ctx = CLSCTX_LOCAL_SERVER; // out-of-process
+    if (mode != IntegrityLevel::Default)
+        cls_ctx |= CLSCTX_ENABLE_CLOAKING; // propagate impersonation
+
+    CComPtr<IUnknown> obj;
+    HRESULT hr = obj.CoCreateInstance(clsid, nullptr, cls_ctx);
     if ((mode == IntegrityLevel::AppContainer) && (hr == E_ACCESSDENIED)) {
         std::wcerr << L"ERROR: CoCreateInstance access denied when trying to create a new COM server instance. Have you remember to grant AppContainer permissions?" << std::endl;
         exit(-3);
     } else {
         CHECK(hr);
     }
-#endif
 
     return obj;
 }

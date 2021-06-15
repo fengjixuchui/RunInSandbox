@@ -91,8 +91,24 @@ STDAPI DllInstall(BOOL bInstall, _In_opt_  LPCWSTR pszCmdLine) {
 
 #else
 
-// EXE Entry Point
-extern "C" int WINAPI _tWinMain(HINSTANCE /*hInstance*/, HINSTANCE /*hPrevInstance*/, LPTSTR /*lpCmdLine*/, int nShowCmd) {
+// EXE Entry Point (console subsystem)
+int wmain(int /*argc*/, wchar_t * /*argv*/[]) {
+    return _AtlModule.WinMain(SW_SHOWDEFAULT);
+}
+// EXE Entry Point (windows subsystem)
+int wWinMain(HINSTANCE /*hInstance*/, HINSTANCE /*hPrevInstance*/, LPTSTR /*lpCmdLine*/, int nShowCmd/*=SW_SHOWDEFAULT*/) {
+    // initialize COM early for programmatic COM security
+    _AtlModule.InitializeCom();
+
+    // Disable COM security to allow any client to connect.
+    // WARNING: Enables non-admin clients to connect to a server running with admin privileges.
+    HRESULT hr = CoInitializeSecurity(nullptr, -1/*auto*/, nullptr, NULL/*reserved*/,
+        RPC_C_AUTHN_LEVEL_DEFAULT, ///< 
+        RPC_C_IMP_LEVEL_IDENTIFY,  ///< allow server to identify but not impersonate client
+        nullptr, EOAC_NONE/*capabilities*/, NULL/*reserved*/);
+    if (FAILED(hr))
+        abort();
+
     return _AtlModule.WinMain(nShowCmd);
 }
 #endif
